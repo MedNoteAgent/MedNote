@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+data/qdrant_data/
+data/icd10_source/
+data/icd10_processed/
+data/memory.db
+*.egg-info/
+dist/
+build/
+.DS_Store
+.ruff_cache/
