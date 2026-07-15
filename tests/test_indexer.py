@@ -9,14 +9,14 @@ query path (named vectors, filters, payload).
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
 
-import numpy as np
 import pytest
 from qdrant_client import QdrantClient, models
+
+from tests.fakes import FakeEmbedder, FakeSparseEncoder
 
 from mednote.rag.etl.parser import ICD10Code
 from mednote.rag.guidelines import GuidelineChunk, load_guideline_chunks
@@ -31,41 +31,6 @@ from mednote.rag.indexer import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_GUIDELINES = REPO_ROOT / "data" / "corpus" / "clinical_guidelines.md"
-
-
-class FakeEmbedder:
-    """Deterministic stand-in for ClinicalEmbedder (no model download)."""
-
-    dimension = 8
-
-    def embed(self, texts: list[str]) -> np.ndarray:
-        return np.array([self._vector(t) for t in texts], dtype=np.float32)
-
-    def embed_query(self, query: str) -> list[float]:
-        return self._vector(query)
-
-    @staticmethod
-    def _vector(text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
-        return [b / 255.0 for b in digest[: FakeEmbedder.dimension]]
-
-
-class FakeSparseEncoder:
-    """Deterministic stand-in for Bm25SparseEncoder: one index per token."""
-
-    def encode(self, texts: list[str]) -> list[models.SparseVector]:
-        return [self._sparse(t) for t in texts]
-
-    def encode_query(self, query: str) -> models.SparseVector:
-        return self._sparse(query)
-
-    @staticmethod
-    def _sparse(text: str) -> models.SparseVector:
-        counts: dict[int, float] = {}
-        for token in text.lower().split():
-            idx = int.from_bytes(hashlib.sha256(token.encode()).digest()[:4], "big")
-            counts[idx] = counts.get(idx, 0.0) + 1.0
-        return models.SparseVector(indices=list(counts), values=list(counts.values()))
 
 
 SAMPLE_CODES = [
