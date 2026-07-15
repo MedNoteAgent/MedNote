@@ -68,6 +68,7 @@ class PathsConfig(BaseModel):
     transcripts_path: str
     ehr_store_path: str
     corpus_dir: str
+    guidelines_path: str
 
 
 class EtlConfig(BaseModel):
