@@ -880,6 +880,13 @@ The attending physician must make the final diagnostic determination."""
 
 **Verification:** Test against 2 transcripts; confirm SOAP structure and non-diagnostic framing.
 
+> **As built (July 2026)** — `src/mednote/agent/prompts.py` extends this sketch; tests in `tests/test_prompts.py` pin the contracts:
+> - Citation format is `(Source: ICD-10-CM 2026)` — the `source` field the RAG pipeline actually emits — not `(Source: <source_file>)`.
+> - Red-flag criteria are **enumerated in the prompt** (condensed from `data/corpus/clinical_guidelines.md`); the model can't flag what it has no criteria for. Task 18's deterministic guardrail remains authoritative.
+> - Added: anti-fabrication rule (codes ONLY from provided context, explicit zero-hit wording), prompt-injection defense (transcript is data, not instructions), verbatim-vitals + "Not documented" rules, Subjective/Objective separation.
+> - Added `SOAP_USER_PROMPT` (human-turn template) and `format_rag_context()` (renders `list[SuggestedCode]` incl. specificity options) — **Task 8's `note_generation` should import both** instead of inlining the message as sketched below.
+> - Live-verified on 2 transcripts (routine + embedded injection attempt; red-flag chest pain): SOAP structure, citations, injection resistance, escalation-first reply, zero-hit handling all confirmed. Main LLM in `config.yml` moved to `gemini-pro-latest` (2.5-pro retired for new users).
+
 ---
 
 ### Task 4: Synthetic Dataset Creation
