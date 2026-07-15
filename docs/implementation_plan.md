@@ -905,7 +905,7 @@ The attending physician must make the final diagnostic determination."""
 > `intent="soap"` and is caught by `guardrail_check`, so those rows carry `intent=soap`
 > with **Red Flag? = YES**.
 
-Create **18 synthetic transcripts**, grouped by the capability each is designed to test.
+Create **19 synthetic transcripts** (TX001–TX019), grouped by the capability each is designed to test.
 
 **A · Core sample-query coverage** (`requirements.md §3` Q1–Q6, one per row):
 
@@ -979,7 +979,7 @@ scenario requires prior context (P001 spans TX001→TX003→TX004 so the `histor
 TX004 has a real prior visit to retrieve).
 
 **Definition of Done:**
-- File committed with all 18 entries; each carries `patient_age`, `patient_sex`,
+- File committed with all 19 entries; each carries `patient_age`, `patient_sex`,
   `expected_intent`, `is_red_flag`, `expected_icd10`, and a `tests` capability tag.
 - The set collectively covers **all six `requirements.md §3` queries**, **all five graph
   intents** (escalation exercised as a red-flag *outcome* via TX005/TX016), both red-flag
