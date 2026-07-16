@@ -1,11 +1,11 @@
 llm:
-  provider: anthropic
-  model: claude-sonnet-4-20250514
+  provider: google
+  model: gemini-pro-latest    # alias: 2.5-pro was retired for new users (404, Jul 2026)
   temperature: 0.0
   max_tokens: 4096
   fast:
-    provider: anthropic
-    model: claude-haiku-4-5-20251001
+    provider: google
+    model: gemini-flash-lite-latest
     max_tokens: 512
 
 embeddings:
@@ -38,11 +38,18 @@ observability:
   trace_dir: data/traces
 
 paths:
-  icd10_source_dir: data/icd10_source
+  icd10_source_dir: data/corpus     # raw CMS.gov XML lives alongside the guidelines corpus
+  icd10_tabular_path: data/corpus/icd10cm_tabular_2026.xml
+  icd10_index_path: data/corpus/icd10cm_index_2026.xml
   icd10_processed_path: data/icd10_processed/icd10_codes.jsonl
   transcripts_path: data/transcripts/synthetic_transcripts.json
   ehr_store_path: data/ehr_store.json
   corpus_dir: data/corpus
+  guidelines_path: data/corpus/clinical_guidelines.md
+
+etl:
+  max_index_synonyms: 10            # cap on Index phrases merged per code before embedding
+  download_url: https://www.cms.gov/files/zip/2026-code-tables-tabular-and-index.zip
 
 edge_cases:
   min_transcript_words: 10

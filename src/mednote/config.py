@@ -62,10 +62,18 @@ class ObservabilityConfig(BaseModel):
 
 class PathsConfig(BaseModel):
     icd10_source_dir: str
+    icd10_tabular_path: str
+    icd10_index_path: str
     icd10_processed_path: str
     transcripts_path: str
     ehr_store_path: str
     corpus_dir: str
+    guidelines_path: str
+
+
+class EtlConfig(BaseModel):
+    max_index_synonyms: int = 10
+    download_url: str
 
 
 class EdgeCasesConfig(BaseModel):
@@ -87,6 +95,7 @@ class MedNoteConfig(BaseModel):
     memory: MemoryConfig
     observability: ObservabilityConfig
     paths: PathsConfig
+    etl: EtlConfig
     edge_cases: EdgeCasesConfig
     demo: DemoConfig
 
