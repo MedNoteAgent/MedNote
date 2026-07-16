@@ -14,14 +14,27 @@ from __future__ import annotations
 
 import json
 
-ENTITY_EXTRACTION_PROMPT = """Extract the primary clinical conditions from this assessment.
-Translate colloquial terms into standard clinical terminology.
+ENTITY_EXTRACTION_PROMPT = """Extract the clinical findings from this text (a SOAP assessment or a doctor-patient transcript).
 Return as a JSON array of strings.
+
+Rules:
+1. Translate colloquial terms into standard clinical terminology.
+2. Include only findings documented as present. A symptom a clinician merely
+   asks about is NOT a finding unless the patient confirms it; a denied
+   symptom is never a finding.
+3. Do not infer or upgrade to a diagnosis. Symptoms stay symptoms
+   ("Chest pain", not "Angina pectoris"; "Wheezing", not "Asthma").
+   Name a disease only when the text explicitly states it as an established
+   assessment or known condition.
 
 Example input: "Looks like the kid has an ear infection in both ears, and the mom's blood pressure is running high"
 Example output: ["Acute bilateral otitis media", "Essential hypertension"]
 
-Assessment:
+Example input: "Doctor: Any shortness of breath or dizziness with the chest pain? Patient: No breathing trouble, but I do feel nauseous and sweaty."
+Example output: ["Chest pain", "Nausea", "Diaphoresis"]
+(dyspnea and dizziness were only asked about, not confirmed; no cardiac diagnosis was stated, so none is extracted)
+
+Text:
 {assessment_text}
 """
 

@@ -102,6 +102,30 @@ def test_extractor_rejects_empty_assessment() -> None:
         EntityExtractor(llm=FakeChatModel([])).extract("   ")
 
 
+def test_extraction_prompt_pins_documented_findings_contract() -> None:
+    """The prompt is a contract: extraction must not treat a clinician's
+    screening question as a confirmed finding, and must not upgrade symptoms
+    to inferred diagnoses (measured failure: chest-pain transcript ->
+    I20.9/I24.81 angina codes plus dyspnea the patient never confirmed)."""
+    from mednote.rag.entity_extractor import ENTITY_EXTRACTION_PROMPT
+
+    lower = ENTITY_EXTRACTION_PROMPT.lower()
+    # Rule: asked-about symptoms are not findings until confirmed.
+    assert "asks about" in lower
+    assert "confirm" in lower
+    assert "denied" in lower
+    # Rule: no diagnosis inference — symptom terms stay symptom-level.
+    assert "do not infer" in lower
+    assert '"chest pain", not "angina pectoris"' in lower
+    # The negative example must demonstrate both rules end-to-end.
+    assert "shortness of breath" in lower
+    assert '["Chest pain", "Nausea", "Diaphoresis"]' in ENTITY_EXTRACTION_PROMPT
+    # Normalization and output format survive the edit.
+    assert "standard clinical terminology" in lower
+    assert "json array of strings" in lower
+    assert "{assessment_text}" in ENTITY_EXTRACTION_PROMPT
+
+
 # --------------------------------------------------------------- pipeline ---
 
 

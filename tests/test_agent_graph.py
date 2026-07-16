@@ -206,3 +206,39 @@ def test_graph_compiles_and_state_seeds_minimal() -> None:
     assert build_graph() is not None
     state = make_initial_state("hello", "trace-1")
     assert state == {"user_input": "hello", "trace_id": "trace-1", "errors": []}
+
+
+# ------------------------------------------------- service factory threading ---
+
+
+def test_get_rag_pipeline_builds_once_under_concurrent_first_calls(monkeypatch) -> None:
+    """UI warm-up thread + a Generate click must never build two pipelines:
+    the second embedded QdrantClient on the same path dies with AlreadyLocked
+    (portalocker) inside the very same process."""
+    import threading
+    import time
+
+    build_calls = []
+    build_started = threading.Event()
+
+    def slow_build():
+        build_calls.append(1)
+        build_started.set()
+        time.sleep(0.05)  # hold the build window open for the second thread
+        return FakeRAGPipeline([G442])
+
+    monkeypatch.setattr(nodes, "_rag_pipeline", None)
+    monkeypatch.setattr(nodes, "_build_rag_pipeline", slow_build)
+
+    results: list = []
+    threads = [
+        threading.Thread(target=lambda: results.append(nodes.get_rag_pipeline()))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(build_calls) == 1, "concurrent first calls must share one build"
+    assert results[0] is results[1]

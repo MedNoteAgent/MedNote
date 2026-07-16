@@ -36,10 +36,19 @@ NOTE_WITH_CODES = (
     "I20.9 - Angina pectoris (Source: ICD-10-CM 2026) (Pending Physician Confirmation)"
 )
 
+EMERGENCY_NOTE = (
+    "🚨 URGENT ESCALATION REQUIRED\n\n"
+    "Red-flag symptom combination detected: **chest pain radiating to the left arm** "
+    "with **diaphoresis** and **nausea** — treat as possible acute coronary syndrome.\n"
+    "Recommend immediate in-person emergency evaluation.\n\n"
+    "### Subjective\nChest pain for 20 minutes.\n\n### Plan\nEmergency referral."
+)
+
 
 def test_empty_transcript_keeps_empty_state(monkeypatch) -> None:
-    empty_update, note_update, codes_update = app.generate_note("   ")
+    empty_update, emergency_update, note_update, codes_update = app.generate_note("   ")
     assert empty_update["visible"] is True
+    assert emergency_update["visible"] is False
     assert note_update["visible"] is False
     assert codes_update["visible"] is False
 
@@ -55,13 +64,81 @@ def test_generate_note_renders_note_without_inline_codes_section(monkeypatch) ->
         }
 
     monkeypatch.setattr(app, "run_agent", fake_run_agent)
-    empty_update, note_update, codes_update = app.generate_note("Doctor: hello\nPatient: hi")
+    empty_update, emergency_update, note_update, codes_update = app.generate_note(
+        "Doctor: hello\nPatient: hi"
+    )
 
     assert empty_update["visible"] is False
+    assert emergency_update["visible"] is False  # routine note: no banner
     assert note_update["visible"] is True
     assert "### Subjective" in note_update["value"]
     # The LLM's inline codes lines are replaced by the structured panel.
     assert "### Suggested ICD-10 Codes" not in note_update["value"]
+    assert codes_update["visible"] is True
+
+
+# ------------------------------------------------------- emergency banner ---
+
+
+def test_split_escalation_detects_llm_preamble() -> None:
+    banner, remainder = app.split_escalation(EMERGENCY_NOTE)
+    assert banner is not None
+    assert "URGENT ESCALATION" in banner
+    assert "acute coronary syndrome" in banner
+    # The SOAP note survives intact, without the escalation preamble.
+    assert remainder.startswith("### Subjective")
+    assert "URGENT ESCALATION" not in remainder
+
+
+def test_split_escalation_detects_guardrail_prefix() -> None:
+    from mednote.agent.prompts import ESCALATION_PROMPT
+
+    note = ESCALATION_PROMPT.format(reason="chest pain radiating to arm") + "\n\n### Subjective\nok"
+    banner, remainder = app.split_escalation(note)
+    assert banner is not None
+    assert "chest pain radiating to arm" in banner
+    assert remainder.startswith("### Subjective")
+
+
+def test_split_escalation_leaves_routine_note_untouched() -> None:
+    banner, remainder = app.split_escalation(NOTE_WITH_CODES)
+    assert banner is None
+    assert remainder == NOTE_WITH_CODES
+
+
+def test_emergency_banner_renders_risks_bold_and_red() -> None:
+    banner, _ = app.split_escalation(EMERGENCY_NOTE)
+    html_out = app.render_emergency_banner(banner)
+
+    assert 'class="emergency-banner"' in html_out
+    assert 'role="alert"' in html_out
+    # Named risks come out as <strong> inside the red banner.
+    assert "<strong>chest pain radiating to the left arm</strong>" in html_out
+    assert "<strong>diaphoresis</strong>" in html_out
+    # No raw markdown emphasis or unescaped user text leaks through.
+    assert "**" not in html_out
+    # The red styling is pinned in the CSS the app ships.
+    assert ".emergency-banner" in app.CSS
+    assert "#d93025" in app.CSS or "#b3261e" in app.CSS
+
+
+def test_generate_note_shows_emergency_banner_for_red_flag_note(monkeypatch) -> None:
+    monkeypatch.setattr(
+        app,
+        "run_agent",
+        lambda *a, **k: {
+            "final_response": EMERGENCY_NOTE,
+            "errors": [],
+            "suggested_codes": SAMPLE_CODES,
+        },
+    )
+    _, emergency_update, note_update, codes_update = app.generate_note("chest pain transcript")
+
+    assert emergency_update["visible"] is True
+    assert "URGENT ESCALATION" in emergency_update["value"]
+    # The note panel shows the SOAP note only — escalation lives in the banner.
+    assert note_update["visible"] is True
+    assert "URGENT ESCALATION" not in note_update["value"]
     assert codes_update["visible"] is True
 
 
@@ -92,7 +169,7 @@ def test_generate_note_surfaces_error_channel(monkeypatch) -> None:
         "run_agent",
         lambda *a, **k: {"final_response": "note", "errors": ["zero hit"], "suggested_codes": []},
     )
-    _, note_update, codes_update = app.generate_note("some transcript")
+    _, _, note_update, codes_update = app.generate_note("some transcript")
     assert "⚠️ zero hit" in note_update["value"]
     assert codes_update["visible"] is False
 
@@ -102,8 +179,9 @@ def test_generate_note_survives_agent_failure(monkeypatch) -> None:
         raise RuntimeError("qdrant locked")
 
     monkeypatch.setattr(app, "run_agent", explode)
-    empty_update, note_update, codes_update = app.generate_note("some transcript")
+    empty_update, emergency_update, note_update, codes_update = app.generate_note("some transcript")
 
     assert empty_update["visible"] is True   # UI falls back, never crashes
+    assert emergency_update["visible"] is False
     assert note_update["visible"] is False
     assert codes_update["visible"] is False

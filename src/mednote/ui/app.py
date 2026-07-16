@@ -11,6 +11,7 @@ Launch (from the repo root, after `scripts/build_index.py` has been run):
 
 import html
 import logging
+import re
 import threading
 
 import gradio as gr
@@ -195,6 +196,38 @@ CSS = """
     margin: 0;
     color: #8a93a6 !important;
 }
+#emergency-output {
+    padding: 20px 20px 0 20px !important;
+}
+.emergency-banner {
+    background: #fdeceb;
+    border: 1px solid #f3c0bc;
+    border-left: 5px solid #d93025;
+    border-radius: 10px;
+    padding: 16px 18px;
+}
+.emergency-banner .emergency-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #b3261e;
+    font-weight: 800;
+    font-size: 1rem;
+    letter-spacing: 0.02em;
+    margin-bottom: 8px;
+}
+.emergency-banner .emergency-body {
+    color: #b3261e;
+    font-weight: 600;
+    font-size: 0.95rem;
+    line-height: 1.65;
+}
+.emergency-banner .emergency-body strong {
+    color: #d93025;
+    font-weight: 800;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
 #note-output {
     padding: 20px !important;
     color: #2a3346 !important;
@@ -312,6 +345,53 @@ def strip_codes_section(note: str) -> str:
     return (note[:start] + rest[next_section:]).rstrip()
 
 
+# Phrases that mark an escalation preamble: the SOAP prompt's rule-4 output
+# and the guardrail's ESCALATION_PROMPT both lead with "URGENT ESCALATION".
+_EMERGENCY_MARKERS = ("urgent escalation", "red-flag", "red flag", "🚨")
+
+
+def split_escalation(note: str) -> tuple[str | None, str]:
+    """Split a leading escalation warning off the note.
+
+    Emergency encounters arrive with the warning ABOVE the SOAP sections
+    (SOAP prompt rule 4, or the guardrail's ESCALATION_PROMPT prefix once
+    Task 18 lands). Returns (escalation_text, remaining_note); escalation_text
+    is None for routine notes.
+    """
+    idx = note.find("### Subjective")
+    if idx == -1:
+        idx = note.find("### ")
+    preamble, remainder = (note, "") if idx == -1 else (note[:idx], note[idx:])
+    preamble = preamble.strip()
+    if preamble and any(marker in preamble.lower() for marker in _EMERGENCY_MARKERS):
+        return preamble, remainder.strip()
+    return None, note
+
+
+def render_emergency_banner(escalation_text: str) -> str:
+    """Render the escalation warning as a red alert banner above the note.
+
+    The named risks (the model bolds them with **...**) become <strong>
+    elements inside the banner, so they read bold-on-red at a glance.
+    """
+    body = html.escape(escalation_text)
+    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
+    body = re.sub(r"^#+\s*", "", body, flags=re.MULTILINE)  # headings would leak as '#'
+    # Drop a leading line that just repeats the banner title.
+    lines = body.splitlines()
+    if lines and "urgent escalation" in lines[0].lower():
+        lines = lines[1:]
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    body = "<br>".join(lines).strip()
+    return (
+        '<div class="emergency-banner" role="alert">'
+        '<div class="emergency-title">🚨 EMERGENCY — URGENT ESCALATION REQUIRED</div>'
+        f'<div class="emergency-body">{body}</div>'
+        "</div>"
+    )
+
+
 def render_code_chips(codes: list[dict]) -> str:
     """Render suggested codes as hoverable chips with confirm checkboxes.
 
@@ -351,7 +431,12 @@ def render_code_chips(codes: list[dict]) -> str:
 def generate_note(transcript: str):
     if not transcript or not transcript.strip():
         gr.Warning("Paste or type a transcript before generating a note.")
-        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
 
     try:
         final = run_agent(
@@ -363,9 +448,18 @@ def generate_note(transcript: str):
     except Exception as exc:  # surface the failure in the UI, never a stack trace
         logger.exception("Agent run failed")
         gr.Warning(f"Note generation failed: {exc}")
-        return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
 
     note = strip_codes_section(final["final_response"])
+    # Emergency encounters carry an escalation warning above the SOAP note —
+    # lift it into a red alert banner instead of rendering it as plain prose.
+    escalation, note = split_escalation(note)
+    banner_html = render_emergency_banner(escalation) if escalation else ""
     # Soft failures (zero-hit, stub tools) ride the errors channel — surface
     # them under the note instead of hiding them (skip any already in the note).
     extra = [e for e in final.get("errors", []) if e not in note]
@@ -375,6 +469,7 @@ def generate_note(transcript: str):
     codes_html = render_code_chips(final.get("suggested_codes") or [])
     return (
         gr.update(visible=False),
+        gr.update(value=banner_html, visible=bool(banner_html)),
         gr.update(value=note, visible=True),
         gr.update(value=codes_html, visible=bool(codes_html)),
     )
@@ -452,6 +547,7 @@ with gr.Blocks(title="MedNote Scribe") as demo:
                 """,
                 elem_id="empty-state-wrap",
             )
+            emergency_output = gr.HTML(visible=False, elem_id="emergency-output")
             note_output = gr.Markdown(visible=False, elem_id="note-output")
             codes_output = gr.HTML(visible=False, elem_id="codes-output")
 
@@ -461,7 +557,7 @@ with gr.Blocks(title="MedNote Scribe") as demo:
     generate_btn.click(
         generate_note,
         inputs=transcript_input,
-        outputs=[empty_state, note_output, codes_output],
+        outputs=[empty_state, emergency_output, note_output, codes_output],
     )
 
 

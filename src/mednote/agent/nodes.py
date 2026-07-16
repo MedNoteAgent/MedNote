@@ -16,6 +16,7 @@ Stubs, replaced by later tasks:
 from __future__ import annotations
 
 import logging
+import threading
 from functools import lru_cache
 
 from mednote.agent.prompts import (
@@ -46,9 +47,27 @@ _TRANSCRIPT_WORD_HINT = 40
 # ------------------------------------------------------- service factories ---
 
 
-@lru_cache(maxsize=1)
+_rag_pipeline = None
+_rag_pipeline_lock = threading.Lock()
+
+
 def get_rag_pipeline():
-    """Real RAG stack (SapBERT + BM25 + embedded Qdrant); built once."""
+    """Real RAG stack (SapBERT + BM25 + embedded Qdrant); built once.
+
+    Double-checked locking, NOT lru_cache: concurrent first calls (the UI's
+    warm-up thread racing a "Generate Note" click) would both execute an
+    lru_cache-wrapped body, and the second embedded QdrantClient on the same
+    path fails with portalocker.AlreadyLocked even within one process.
+    """
+    global _rag_pipeline
+    if _rag_pipeline is None:
+        with _rag_pipeline_lock:
+            if _rag_pipeline is None:
+                _rag_pipeline = _build_rag_pipeline()
+    return _rag_pipeline
+
+
+def _build_rag_pipeline():
     from mednote.rag.cache import RAGCache
     from mednote.rag.embeddings import Bm25SparseEncoder, ClinicalEmbedder
     from mednote.rag.entity_extractor import EntityExtractor
