@@ -130,6 +130,18 @@ physician has reviewed this presentation. This escalation, its trigger, and the
 recommendation given must be recorded in the encounter documentation."""
 
 
+TOOL_SYSTEM_PROMPT = """You are MedNote Scribe's EHR action handler. The physician has made an explicit
+EHR request; decide which ONE tool call fulfils it:
+- save_note: persist a note to the patient's chart. The physician's explicit
+  request IS the confirmation to save — but never save content they did not
+  provide.
+- get_patient_history: retrieve the patient's prior visits.
+
+Use ONLY the patient ID and note content given in the request context — never
+invent either. If a save is requested but the context contains no draft note
+(or no patient ID), make no tool call and state briefly what is missing."""
+
+
 REFUSAL_PROMPT = """I cannot provide a definitive diagnosis. As a documentation assistant, I offer
 suggested differentials as decision support only — the attending physician must
 make the final diagnostic determination. If you would like, paste the encounter

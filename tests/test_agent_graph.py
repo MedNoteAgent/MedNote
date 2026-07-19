@@ -157,10 +157,100 @@ def test_refuse_path_returns_refusal_prompt(fakes) -> None:
     assert final["final_response"] == REFUSAL_PROMPT
 
 
-def test_save_path_reports_stub_tool_honestly(fakes) -> None:
-    final = run_agent(BY_ID["TX003"]["transcript"])
+class FakeToolLLM:
+    """Stands in for the tool-bound LLM: returns canned tool_calls."""
+
+    def __init__(self, tool_calls: list[dict], content: str = ""):
+        self._tool_calls = tool_calls
+        self._content = content
+        self.messages = None  # records the prompt, for asserts
+
+    def invoke(self, messages):
+        self.messages = messages
+        return SimpleNamespace(content=self._content, tool_calls=self._tool_calls)
+
+
+@pytest.fixture()
+def ehr(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Real EHR app on a temp store, injected into the tools' HTTP client."""
+    from fastapi.testclient import TestClient
+
+    from mednote.tools import ehr_api, ehr_client
+
+    monkeypatch.setattr(ehr_api, "get_store_path", lambda: tmp_path / "ehr_store.json")
+    monkeypatch.setattr(ehr_client, "get_client", lambda: TestClient(ehr_api.app))
+
+
+def test_save_path_executes_tool_and_returns_note_id(fakes, ehr, monkeypatch) -> None:
+    tool_llm = FakeToolLLM(
+        [{"name": "save_note", "args": {"patient_id": "P001", "note": "SOAP body"},
+          "id": "call_1", "type": "tool_call"}]
+    )
+    monkeypatch.setattr(nodes, "get_tool_llm", lambda: tool_llm)
+
+    final = run_agent(BY_ID["TX003"]["transcript"], patient_id="P001")
+    assert final["tool_result"]["ok"] is True
+    assert final["tool_result"]["note_id"].startswith("N_")
+    assert final["tool_result"]["note_id"] in final["final_response"]
+    # The request context handed to the LLM carried the patient ID.
+    assert "P001" in str(tool_llm.messages)
+
+
+def test_save_path_degrades_when_ehr_down(fakes, monkeypatch) -> None:
+    import httpx
+
+    from mednote.tools import ehr_client
+
+    tool_llm = FakeToolLLM(
+        [{"name": "save_note", "args": {"patient_id": "P001", "note": "SOAP body"},
+          "id": "call_1", "type": "tool_call"}]
+    )
+    monkeypatch.setattr(nodes, "get_tool_llm", lambda: tool_llm)
+    monkeypatch.setattr(
+        ehr_client,
+        "get_client",
+        lambda: httpx.Client(base_url="http://127.0.0.1:59999", timeout=0.2),
+    )
+
+    final = run_agent(BY_ID["TX003"]["transcript"], patient_id="P001")
     assert final["tool_result"]["ok"] is False
     assert "NOT saved" in final["final_response"]
+    assert final["errors"]
+
+
+def test_save_path_without_tool_call_reports_whats_missing(fakes, monkeypatch) -> None:
+    tool_llm = FakeToolLLM([], content="No draft note was provided to save.")
+    monkeypatch.setattr(nodes, "get_tool_llm", lambda: tool_llm)
+
+    final = run_agent(BY_ID["TX003"]["transcript"], patient_id="P001")
+    assert final["tool_result"]["ok"] is False
+    assert final["final_response"] == "No draft note was provided to save."
+
+
+def test_context_extraction_pulls_demographics_from_ehr(ehr) -> None:
+    result = nodes.context_extraction({"user_input": "x", "patient_id": "P005"})
+    assert result == {"patient_sex": "male", "patient_age": 4}
+
+
+def test_context_extraction_caller_demographics_win(ehr) -> None:
+    result = nodes.context_extraction(
+        {"user_input": "x", "patient_id": "P005", "patient_sex": "male", "patient_age": 4}
+    )
+    assert result == {}
+
+
+def test_context_extraction_degrades_when_ehr_down(monkeypatch) -> None:
+    import httpx
+
+    from mednote.tools import ehr_client
+
+    monkeypatch.setattr(
+        ehr_client,
+        "get_client",
+        lambda: httpx.Client(base_url="http://127.0.0.1:59999", timeout=0.2),
+    )
+    result = nodes.context_extraction({"user_input": "x", "patient_id": "P001"})
+    assert result == {"patient_sex": "unknown"}
 
 
 def test_history_path_reports_stub_memory(fakes) -> None:
@@ -242,3 +332,17 @@ def test_get_rag_pipeline_builds_once_under_concurrent_first_calls(monkeypatch) 
 
     assert len(build_calls) == 1, "concurrent first calls must share one build"
     assert results[0] is results[1]
+
+
+def test_close_rag_pipeline_releases_and_is_idempotent(monkeypatch) -> None:
+    """The notebooks' §'release the Qdrant lock' entry point (no private pokes)."""
+    closed = []
+    fake = SimpleNamespace(
+        retriever=SimpleNamespace(client=SimpleNamespace(close=lambda: closed.append(1)))
+    )
+    monkeypatch.setattr(nodes, "_rag_pipeline", fake)
+
+    assert nodes.close_rag_pipeline() is True
+    assert closed == [1]
+    assert nodes._rag_pipeline is None
+    assert nodes.close_rag_pipeline() is False  # nothing left to close

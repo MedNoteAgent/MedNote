@@ -9,7 +9,6 @@ Heavy services (SapBERT, Qdrant, the LLMs) are built lazily by the cached
 
 Stubs, replaced by later tasks:
     guardrail_check   Task 18 (deterministic red-flag + dosage rules)
-    tool_execution    Tasks 11-13 (mock EHR + MCP)
     memory_lookup     Tasks 14-15 (visit memory)
 """
 
@@ -24,6 +23,7 @@ from mednote.agent.prompts import (
     REFUSAL_PROMPT,
     SOAP_SYSTEM_PROMPT,
     SOAP_USER_PROMPT,
+    TOOL_SYSTEM_PROMPT,
     format_rag_context,
 )
 from mednote.agent.state import MedNoteState
@@ -67,6 +67,24 @@ def get_rag_pipeline():
     return _rag_pipeline
 
 
+def close_rag_pipeline() -> bool:
+    """Close the embedded Qdrant client and drop the cached pipeline.
+
+    Releases the single-process lock on data/qdrant_data/ so CLI scripts or
+    another notebook kernel can open the store. Returns True if a pipeline
+    was actually closed; safe to call when nothing was ever built.
+    """
+    global _rag_pipeline
+    with _rag_pipeline_lock:
+        if _rag_pipeline is None:
+            return False
+        try:
+            _rag_pipeline.retriever.client.close()
+        finally:
+            _rag_pipeline = None
+        return True
+
+
 def _build_rag_pipeline():
     from mednote.rag.cache import RAGCache
     from mednote.rag.embeddings import Bm25SparseEncoder, ClinicalEmbedder
@@ -94,6 +112,15 @@ def get_note_llm():
     from mednote.llm.wrapper import get_llm
 
     return get_llm()
+
+
+@lru_cache(maxsize=1)
+def get_tool_llm():
+    """Main LLM bound to the EHR tools (Tasks 11-13)."""
+    from mednote.llm.wrapper import get_llm
+    from mednote.tools import get_patient_history, save_note
+
+    return get_llm().bind_tools([save_note, get_patient_history])
 
 
 def _llm_text(message) -> str:
@@ -136,15 +163,31 @@ def parse_input(state: MedNoteState) -> dict:
 
 
 def context_extraction(state: MedNoteState) -> dict:
-    """Patient demographics for RAG hard-filtering.
+    """Patient demographics for RAG hard-filtering (Step 7.1).
 
-    The mock EHR arrives in Task 11; until then, demographics provided by the
-    caller (UI / eval harness, from the dataset labels) pass through, and
-    anything unknown stays unknown — the retriever never excludes on missing
-    information.
+    Caller-supplied demographics (UI / eval harness) win; otherwise the mock
+    EHR (Task 11) is asked by patient ID. Anything still unknown stays
+    unknown — the retriever never excludes on missing information, and an
+    unreachable EHR degrades gracefully instead of blocking the note.
     """
     if state.get("patient_sex"):
         return {}
+
+    patient_id = state.get("patient_id")
+    if patient_id:
+        from mednote.tools.ehr_client import EhrApiError, fetch_demographics
+
+        try:
+            result = fetch_demographics(patient_id)
+        except EhrApiError as exc:
+            logger.warning("EHR demographics unavailable (%s); proceeding unfiltered", exc)
+        else:
+            if result.get("status") == "found":
+                patient = result["patient"]
+                updates: dict = {"patient_sex": patient.get("sex", "unknown")}
+                if state.get("patient_age") is None and patient.get("age") is not None:
+                    updates["patient_age"] = patient["age"]
+                return updates
     return {"patient_sex": "unknown"}
 
 
@@ -229,12 +272,95 @@ def guardrail_check(_state: MedNoteState) -> dict:
     }
 
 
-def tool_execution(_state: MedNoteState) -> dict:
-    """STUB until Tasks 11-13 (mock EHR + save_note over MCP)."""
-    detail = (
-        "The EHR save tool is not available yet (arrives with Tasks 11-13). "
-        "The note was NOT saved."
+def tool_execution(state: MedNoteState) -> dict:
+    """Execute the physician's explicit EHR request via LLM tool calling (Task 13).
+
+    Reached only on ``intent="save"`` — the routing itself is the guardrail-G5
+    confirmation gate (no auto-save: a save happens only because the physician
+    asked for one). The bound LLM picks the tool + arguments from the request
+    context; we execute it and report a typed ToolResult. An unreachable EHR
+    degrades to a clear "NOT saved" message on the errors channel.
+    """
+    from mednote.tools import get_patient_history, save_note
+    from mednote.tools.ehr_client import EhrApiError
+
+    registry = {"save_note": save_note, "get_patient_history": get_patient_history}
+
+    context_lines = [f"Request: {state['user_input']}"]
+    if state.get("patient_id"):
+        context_lines.append(f"Patient ID: {state['patient_id']}")
+    if state.get("draft_note"):
+        context_lines.append(f"Draft note to save:\n{state['draft_note']}")
+    codes = [c["code"] for c in state.get("suggested_codes") or []]
+    if codes:
+        context_lines.append(f"Suggested ICD-10 codes: {', '.join(codes)}")
+
+    response = get_tool_llm().invoke(
+        [("system", TOOL_SYSTEM_PROMPT), ("human", "\n\n".join(context_lines))]
     )
+
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if not tool_calls:
+        detail = _llm_text(response).strip() or (
+            "No EHR action was taken — the request did not contain enough "
+            "information (a patient ID and note content are required)."
+        )
+        return {
+            "tool_result": {"ok": False, "detail": detail, "note_id": None},
+            "errors": [detail],
+        }
+
+    call = tool_calls[0]
+    tool = registry.get(call["name"])
+    if tool is None:
+        detail = f"Unknown tool requested: '{call['name']}'. No EHR action was taken."
+        return {
+            "tool_result": {"ok": False, "detail": detail, "note_id": None},
+            "errors": [detail],
+        }
+
+    try:
+        result = tool.invoke(call["args"])
+    except EhrApiError as exc:
+        detail = (
+            "Unable to reach the EHR at this time — the note was NOT saved. "
+            f"Please try again or save manually. ({exc})"
+        )
+        return {
+            "tool_result": {"ok": False, "detail": detail, "note_id": None},
+            "errors": [detail],
+        }
+
+    return _format_tool_result(call["name"], result)
+
+
+def _format_tool_result(tool_name: str, result: dict) -> dict:
+    """Map an EHR API envelope onto a typed ToolResult update."""
+    status = result.get("status")
+
+    if tool_name == "save_note" and status == "saved":
+        detail = (
+            f"Note saved to patient {result['patient_id']}'s chart "
+            f"(note ID {result['note_id']})."
+        )
+        return {"tool_result": {"ok": True, "detail": detail, "note_id": result["note_id"]}}
+
+    if tool_name == "get_patient_history":
+        if status == "found":
+            lines = [f"Prior visits for patient {result['patient_id']}:"]
+            for visit in result.get("visits", []):
+                visit_codes = ", ".join(visit.get("icd_codes") or []) or "no codes"
+                lines.append(
+                    f"- {visit.get('date')}: note {visit.get('note_id')} ({visit_codes})"
+                )
+            return {
+                "tool_result": {"ok": True, "detail": "\n".join(lines), "note_id": None}
+            }
+        if status == "no_history":
+            detail = result.get("message", "No prior visits found.")
+            return {"tool_result": {"ok": True, "detail": detail, "note_id": None}}
+
+    detail = result.get("message") or f"EHR request failed: {result}"
     return {
         "tool_result": {"ok": False, "detail": detail, "note_id": None},
         "errors": [detail],
