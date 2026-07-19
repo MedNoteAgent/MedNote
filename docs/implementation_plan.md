@@ -1559,6 +1559,8 @@ Run: `uv run python -m mednote.ui.app`
 - **Found:** `{"status": "found", "patient_id": "P001", "visits": [...]}`
 - **No history:** `{"status": "no_history", "patient_id": "P001", "message": "No prior visits found"}`
 
+> **As built (2026-07-19)** — `docs/tools.md` written *after* Tasks 11–13 landed (spec-first order inverted), so it is transcribed from verified behavior rather than intent. Additions over the sketch above: the demographics endpoint `GET /patients/{id}` (documented as internal plumbing, deliberately not a tool), the two exposure surfaces (LangChain + MCP) with the shared-`ehr_client` no-drift rule, the `EhrApiError` failure contract, exact HTTP status codes (404 error envelope / 422 validation), and the guardrail-G5 note. Task 10 complete.
+
 ---
 
 ### Task 11: Mock EHR API + `save_note` Tool
