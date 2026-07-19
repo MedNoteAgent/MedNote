@@ -1525,7 +1525,13 @@ Run: `uv run python -m mednote.ui.app`
 
 ## Week 2: Tools, MCP & Memory (Tasks 10–16)
 
-**Demo Goal:** The same Gradio UI now saves a note through the mock EHR tool and recalls a patient's prior-visit context; visible live in the chat.
+**Demo Goal:** The same Gradio UI now saves a note through the mock EHR tool and recalls a patient's prior-visit context — surfaced in the workspace UI (a "Save to EHR" action on the generated note plus a prior-visits panel), since the shipped UI is a single-shot Blocks workspace, not a chat (see Task 16 status note).
+
+> **Status (2026-07-18, start of `ft_mcp_build`)** — Tasks 10–16 are **not started**: `src/mednote/tools/`, `src/mednote/mcp/`, and `src/mednote/memory/` contain only `__init__.py`, and `docs/tools.md` does not exist. However, Week 1 already delivered parts this section tells you to build — don't redo them:
+> - `graph.py` already routes `save → tool_execution` and `history → memory_lookup` (Task 13's "update graph routing" bullet is done).
+> - `nodes.py` already has stub `tool_execution` and `memory_lookup` returning typed `ToolResult`/`MemoryContext` with honest "not available yet" messages — Tasks 13/15 **replace the stub bodies**, no wiring changes needed.
+> - `context_extraction` (nodes.py) is explicitly waiting on Task 11's mock EHR to supply patient demographics — see the Task 11 addition below.
+> - The UI is already `gr.Blocks` (Task 16's "upgrade from ChatInterface" premise is obsolete — see Task 16 note).
 
 ### Task 10: Tool Specifications
 
@@ -1562,7 +1568,13 @@ Run: `uv run python -m mednote.ui.app`
 **`src/mednote/tools/ehr_api.py`** — FastAPI app (host/port from `config.yml` → `ehr_api`, store path from `config.yml` → `paths.ehr_store_path`):
 - `POST /notes` — validates input, saves to `paths.ehr_store_path` (default `data/ehr_store.json`), returns `note_id`
 - `GET /patients/{patient_id}/history` — reads from JSON store
+- `GET /patients/{patient_id}` — patient demographics (name, DOB/age, sex). **Required by `context_extraction`** (Step 7.1): the node currently passes demographics through from the caller and defaults `patient_sex="unknown"` with a docstring that says "the mock EHR arrives in Task 11" — this endpoint is what it will call. Seed `ehr_store.json` with the P001–P013 patients from the Task 4 transcript set so demographics line up with the eval labels.
 - Error handling for missing fields, invalid `patient_id`
+
+> **As built (2026-07-18)** — Tasks 11–13 landed together on `ft_mcp_build`:
+> - Seed patients (P001–P013 + the UI's `P-DEMO`/Sarah Jenkins) live as a constant in `ehr_api.py`; the JSON store is created from it on first write and is **gitignored** (runtime-mutated data, not a committed fixture). A test pins seed demographics against the Task 4 dataset labels.
+> - All HTTP access goes through one module, `src/mednote/tools/ehr_client.py` (`post_note` / `fetch_history` / `fetch_demographics`, `EhrApiError` on connection failure) — the LangChain tools, the MCP server, and `context_extraction` are thin delegates, so the surfaces cannot drift.
+> - `context_extraction` now fetches age/sex from `GET /patients/{id}` when the caller didn't supply them, degrading to `"unknown"` (with a log warning) when the EHR is down.
 
 **`src/mednote/tools/save_note.py`:**
 ```python
@@ -1609,27 +1621,35 @@ def get_patient_history(patient_id: str) -> str:
 
 **Time:** ~1 hour | **Depends on:** Tasks 11, 12 | **tasks.md ref:** Task 13
 
-**`src/mednote/mcp/server.py`** — use `mcp` Python SDK with stdio transport:
+**`src/mednote/mcp/server.py`** — use the `mcp` Python SDK's **FastMCP** API with stdio transport. (The lockfile pins `mcp 1.28.1`; the low-level `mcp.server.Server` class has **no** `@app.tool()` decorator — an earlier sketch here used it and would fail on import. `FastMCP` is the supported decorator-based API.)
 
 ```python
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
+from mcp.server.fastmcp import FastMCP
 
-app = Server("mednote-ehr")
+mcp = FastMCP("mednote-ehr")
 
-@app.tool()
-async def save_note(patient_id: str, note: str, icd_codes: list[str] = []) -> str:
+@mcp.tool()
+def save_note(patient_id: str, note: str, icd_codes: list[str] | None = None) -> dict:
     """Save a clinical note to the EHR."""
-    ...
+    ...  # delegate to src/mednote/tools/save_note.py (same httpx call as the LangChain tool)
 
-@app.tool()
-async def get_patient_history(patient_id: str) -> str:
+@mcp.tool()
+def get_patient_history(patient_id: str) -> dict:
     """Get patient visit history from the EHR."""
-    ...
+    ...  # delegate to src/mednote/tools/get_history.py
+
+if __name__ == "__main__":
+    mcp.run()   # stdio transport by default
 ```
 
-Update `tool_execution` node: binds tools to the LLM via `llm.bind_tools()` and handles tool call responses.
-Update graph routing: `parse_input` routes "save" intent → `tool_execution`.
+Both the MCP server and the LangChain `@tool` wrappers (Tasks 11–12) delegate to the same underlying functions, so tool behavior can't drift between the two surfaces.
+
+Update `tool_execution` node: **replace the Week 1 stub body** (it currently returns a typed "tool not available yet" `ToolResult`) — bind tools to the LLM via `llm.bind_tools()` and handle tool call responses.
+~~Update graph routing: `parse_input` routes "save" intent → `tool_execution`.~~ **Already done in Week 1** — `graph.py` has this edge; only the node body changes.
+
+> **As built (2026-07-18)** — `tool_execution` invokes a `get_tool_llm()` factory (main LLM + `bind_tools`, monkeypatchable in tests like the other factories) with `TOOL_SYSTEM_PROMPT` (in `prompts.py`) and a request context carrying `user_input`, `patient_id`, `draft_note`, and suggested codes from state. The first tool call is executed and mapped to a typed `ToolResult`; no tool call → honest "what's missing" reply; `EhrApiError` → "the note was NOT saved" on the errors channel (Task 30's EHR-down edge case, landed early). Reaching the node only via explicit `save` intent remains the guardrail-G5 confirmation gate.
+>
+> **Definition of Done verified live:** seeded demographics fetch, `save_note` → `note_id` (`N_…`), and history recall all round-trip against `uvicorn mednote.tools.ehr_api:app --port 8100`; 134 tests pass (20 new across `test_ehr_api.py`, `test_tools.py`, `test_mcp_server.py`, `test_agent_graph.py`).
 
 **Definition of Done:** Full round-trip: "Save this note to patient P001's chart" → tool call → `note_id` returned.
 
@@ -1705,7 +1725,9 @@ def memory_lookup(state: MedNoteState) -> dict:
     return {"memory_context": {"patient_id": patient_id, "prior_visits": [], "summary": "No prior visits found."}}
 ```
 
-Also update `note_generation` to inject `memory_context` into the LLM prompt when available.
+Also update `note_generation` to inject `memory_context` into the LLM prompt when available. **As-built note:** `note_generation` no longer inlines its human message — it renders `SOAP_USER_PROMPT.format(rag_context=..., transcript=...)` from `agent/prompts.py`. Inject memory by extending `SOAP_USER_PROMPT` with an optional prior-visits block (and keep `tests/test_prompts.py` contracts green), not by rewriting the node's message construction.
+
+(The Week 1 `memory_lookup` stub already returns a typed `MemoryContext` with a "no records yet" summary — this task replaces its body with the real `MemoryStore` lookup; the graph edge to `response_generation` already exists.)
 
 **Test:** Save a note in session 1; query "what was noted last visit" in session 2 → should surface the prior note.
 
@@ -1715,24 +1737,20 @@ Also update `note_generation` to inject `memory_context` into the LLM prompt whe
 
 **Time:** ~1 hour | **Depends on:** Tasks 13, 15 | **tasks.md ref:** Task 16
 
-Upgrade UI from `ChatInterface` to `Blocks`:
+> **Premise update (2026-07-18):** the original sketch here ("upgrade `ChatInterface` to `Blocks` with a `gr.Chatbot`") is obsolete. Week 1 shipped `ui/app.py` as a full `gr.Blocks` **workspace**: header + patient chip, transcript panel with routine/emergency presets on the left, and empty-state / escalation banner / SOAP note / ICD-10 code chips on the right — there is no chatbot and no free-text query loop. Task 16 is therefore *additive to the existing layout*, not a rewrite.
+
+Add to the existing `gr.Blocks` app:
+
+1. **Agent Trace accordion** under the note column:
 
 ```python
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🩺 MedNote Scribe")
-
-    with gr.Row():
-        with gr.Column(scale=2):
-            chatbot = gr.Chatbot(height=500)
-            msg = gr.Textbox(label="Enter transcript or query")
-            submit = gr.Button("Submit", variant="primary")
-
-        with gr.Column(scale=1):
-            with gr.Accordion("🔍 Agent Trace", open=False):
-                trace_output = gr.JSON(label="Execution Trace")
+with gr.Accordion("🔍 Agent Trace", open=False):
+    trace_output = gr.JSON(label="Execution Trace")
 ```
 
-Trace data includes: nodes traversed, RAG chunks (text + source), tool calls (args + result), memory lookups, timing per node.
+2. **Save + history surfaces for the Week 2 demo** (the workspace has no chat box to type "save this note", so the `save`/`history` intents need UI affordances): a "💾 Save to EHR" button on the generated note (calls the agent with the save intent → shows the returned `note_id`) and a "Prior Visits" panel or accordion fed by `memory_lookup`.
+
+**Trace data source:** the full `RequestTrace` tracer only arrives in Task 24 (Week 4). For this task, render the trace from the **final agent state** returned by `run_agent(...)` — it already carries `extracted_entities`, `suggested_codes` (with confidence + source), `cache_hit`, `guardrail_result`, `tool_result`, `memory_context`, and `errors`. Per-node timing and raw top-15 retrieval chunks are deferred to Task 24; don't build a second tracer here.
 
 ---
 
