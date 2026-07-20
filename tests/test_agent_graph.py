@@ -81,6 +81,16 @@ class ExplodingLLM:
         raise AssertionError("note LLM must not be called on this path")
 
 
+@pytest.fixture(autouse=True)
+def _memory_store(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Every test gets its own SQLite file — never touch data/memory.db."""
+    from mednote.memory.store import MemoryStore
+
+    store = MemoryStore(str(tmp_path / "memory.db"))
+    monkeypatch.setattr(nodes, "get_memory_store", lambda: store)
+    return store
+
+
 @pytest.fixture()
 def fakes(monkeypatch: pytest.MonkeyPatch):
     pipeline = FakeRAGPipeline([G442])
@@ -157,15 +167,72 @@ def test_refuse_path_returns_refusal_prompt(fakes) -> None:
     assert final["final_response"] == REFUSAL_PROMPT
 
 
-def test_save_path_reports_stub_tool_honestly(fakes) -> None:
+def test_save_without_a_note_reports_honest_error(fakes) -> None:
+    """"save" alone, with nothing generated yet, must not fabricate a save."""
     final = run_agent(BY_ID["TX003"]["transcript"])
     assert final["tool_result"]["ok"] is False
-    assert "NOT saved" in final["final_response"]
+    assert "Nothing to save yet" in final["final_response"]
 
 
-def test_history_path_reports_stub_memory(fakes) -> None:
+def test_save_persists_note_to_ehr_and_mirrors_into_memory(
+    fakes, tmp_path, monkeypatch
+) -> None:
+    from mednote.tools import save_note as save_note_module
+    from mednote.tools.ehr_api import EHRStore
+
+    ehr_store = EHRStore(str(tmp_path / "ehr.json"))
+    monkeypatch.setattr(save_note_module, "get_ehr_store", lambda: ehr_store)
+
+    final = run_agent(
+        BY_ID["TX003"]["transcript"],
+        patient_id="P001",
+        note="### Subjective\nHeadache.\n\n### Plan\nFollow-up.",
+        suggested_codes=[G442],
+    )
+
+    assert final["tool_result"]["ok"] is True
+    note_id = final["tool_result"]["note_id"]
+    assert note_id.startswith("N_")
+    assert f"note ID {note_id}" in final["final_response"]
+
+    ehr_history = ehr_store.get_history("P001")
+    assert ehr_history["status"] == "found"
+    assert ehr_history["visits"][0]["note_id"] == note_id
+    assert ehr_history["visits"][0]["icd_codes"] == ["G44.2"]
+
+    memory_history = nodes.get_memory_store().get_history("P001")
+    assert memory_history[0]["note_id"] == note_id
+
+
+def test_history_path_reports_no_prior_visits_for_new_patient(fakes) -> None:
     final = run_agent(BY_ID["TX004"]["transcript"], patient_id="P001")
-    assert "No prior visit records" in final["final_response"]
+    assert final["final_response"] == "No prior visits found."
+
+
+def test_history_recalls_note_saved_in_a_prior_session(
+    fakes, tmp_path, monkeypatch
+) -> None:
+    """Task 15 DoD: a fact from session 1's saved note is recalled, unprompted,
+    in a fresh session-2 run_agent() call — the graph itself carries no
+    conversation memory, so the recall must come from the memory store."""
+    from mednote.tools import save_note as save_note_module
+    from mednote.tools.ehr_api import EHRStore
+
+    monkeypatch.setattr(
+        save_note_module, "get_ehr_store", lambda: EHRStore(str(tmp_path / "ehr.json"))
+    )
+
+    session1 = run_agent(
+        BY_ID["TX003"]["transcript"],
+        patient_id="P001",
+        note="### Subjective\nHeadache for 3 days, worse in the mornings.\n\n### Plan\nFollow-up in 2 weeks.",
+        suggested_codes=[G442],
+    )
+    assert session1["tool_result"]["ok"] is True
+
+    session2 = run_agent(BY_ID["TX004"]["transcript"], patient_id="P001")
+    assert "Headache for 3 days, worse in the mornings" in session2["final_response"]
+    assert session2["final_response"] != "No prior visits found."
 
 
 def test_zero_hit_accumulates_error_and_still_drafts(monkeypatch) -> None:

@@ -46,11 +46,15 @@ EMERGENCY_NOTE = (
 
 
 def test_empty_transcript_keeps_empty_state(monkeypatch) -> None:
-    empty_update, emergency_update, note_update, codes_update = app.generate_note("   ")
+    empty_update, emergency_update, note_update, codes_update, trace_update, state = (
+        app.generate_note("   ")
+    )
     assert empty_update["visible"] is True
     assert emergency_update["visible"] is False
     assert note_update["visible"] is False
     assert codes_update["visible"] is False
+    assert trace_update["visible"] is False
+    assert state is None
 
 
 def test_generate_note_renders_note_without_inline_codes_section(monkeypatch) -> None:
@@ -61,11 +65,13 @@ def test_generate_note_renders_note_without_inline_codes_section(monkeypatch) ->
             "final_response": NOTE_WITH_CODES,
             "errors": [],
             "suggested_codes": SAMPLE_CODES,
+            "intent": "soap",
+            "draft_note": NOTE_WITH_CODES,
         }
 
     monkeypatch.setattr(app, "run_agent", fake_run_agent)
-    empty_update, emergency_update, note_update, codes_update = app.generate_note(
-        "Doctor: hello\nPatient: hi"
+    empty_update, emergency_update, note_update, codes_update, trace_update, state = (
+        app.generate_note("Doctor: hello\nPatient: hi")
     )
 
     assert empty_update["visible"] is False
@@ -75,6 +81,9 @@ def test_generate_note_renders_note_without_inline_codes_section(monkeypatch) ->
     # The LLM's inline codes lines are replaced by the structured panel.
     assert "### Suggested ICD-10 Codes" not in note_update["value"]
     assert codes_update["visible"] is True
+    assert trace_update["visible"] is True
+    assert trace_update["value"]["intent"] == "soap"
+    assert state["draft_note"] == NOTE_WITH_CODES
 
 
 # ------------------------------------------------------- emergency banner ---
@@ -132,7 +141,9 @@ def test_generate_note_shows_emergency_banner_for_red_flag_note(monkeypatch) -> 
             "suggested_codes": SAMPLE_CODES,
         },
     )
-    _, emergency_update, note_update, codes_update = app.generate_note("chest pain transcript")
+    _, emergency_update, note_update, codes_update, _trace, _state = app.generate_note(
+        "chest pain transcript"
+    )
 
     assert emergency_update["visible"] is True
     assert "URGENT ESCALATION" in emergency_update["value"]
@@ -169,7 +180,7 @@ def test_generate_note_surfaces_error_channel(monkeypatch) -> None:
         "run_agent",
         lambda *a, **k: {"final_response": "note", "errors": ["zero hit"], "suggested_codes": []},
     )
-    _, _, note_update, codes_update = app.generate_note("some transcript")
+    _, _, note_update, codes_update, _trace, _state = app.generate_note("some transcript")
     assert "⚠️ zero hit" in note_update["value"]
     assert codes_update["visible"] is False
 
@@ -179,9 +190,93 @@ def test_generate_note_survives_agent_failure(monkeypatch) -> None:
         raise RuntimeError("qdrant locked")
 
     monkeypatch.setattr(app, "run_agent", explode)
-    empty_update, emergency_update, note_update, codes_update = app.generate_note("some transcript")
+    empty_update, emergency_update, note_update, codes_update, trace_update, state = (
+        app.generate_note("some transcript")
+    )
 
     assert empty_update["visible"] is True   # UI falls back, never crashes
     assert emergency_update["visible"] is False
     assert note_update["visible"] is False
     assert codes_update["visible"] is False
+    assert trace_update["visible"] is False
+    assert state is None
+
+
+# ------------------------------------------------------------- trace panel ---
+
+
+def test_build_trace_summarizes_rag_tool_and_memory() -> None:
+    final = {
+        "intent": "soap",
+        "extracted_entities": ["Tension-type headache"],
+        "suggested_codes": SAMPLE_CODES,
+        "cache_hit": True,
+        "memory_context": {
+            "patient_id": "P-DEMO",
+            "prior_visits": [{"note_id": "N_1"}],
+            "summary": "Prior visits:\n- 2026-07-01: headache",
+        },
+        "tool_result": {"ok": True, "detail": "saved", "note_id": "N_2"},
+        "errors": [],
+    }
+    trace = app.build_trace(final)
+
+    assert trace["intent"] == "soap"
+    assert trace["cache_hit"] is True
+    assert trace["rag_retrieval"][0]["code"] == "I20.9"
+    assert trace["memory_used"]["prior_visit_count"] == 1
+    assert trace["tool_call"]["note_id"] == "N_2"
+
+
+# --------------------------------------------------------------- save/history ---
+
+
+def test_save_to_chart_without_a_generated_note_warns() -> None:
+    result = app.save_to_chart(None)
+    assert result["visible"] is False
+
+
+def test_save_to_chart_calls_run_agent_with_the_generated_note(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run_agent(user_input, **kwargs):
+        captured["user_input"] = user_input
+        captured.update(kwargs)
+        return {"tool_result": {"ok": True, "detail": "saved", "note_id": "N_1"}}
+
+    monkeypatch.setattr(app, "run_agent", fake_run_agent)
+    agent_state = {"draft_note": "### Subjective\nok", "suggested_codes": SAMPLE_CODES}
+
+    result = app.save_to_chart(agent_state)
+
+    assert captured["patient_id"] == app.MOCK_PATIENT_ID
+    assert captured["note"] == agent_state["draft_note"]
+    assert captured["suggested_codes"] == SAMPLE_CODES
+    assert result["visible"] is True
+    assert result["value"]["note_id"] == "N_1"
+
+
+def test_load_patient_history_renders_no_history_message(monkeypatch, tmp_path) -> None:
+    import mednote.tools.get_history as get_history_module
+    from mednote.tools.ehr_api import EHRStore
+
+    monkeypatch.setattr(
+        get_history_module, "get_ehr_store", lambda: EHRStore(str(tmp_path / "ehr.json"))
+    )
+    result = app.load_patient_history()
+    assert result["visible"] is True
+    assert "No prior visits" in result["value"]
+
+
+def test_load_patient_history_renders_prior_visits(monkeypatch, tmp_path) -> None:
+    import mednote.tools.get_history as get_history_module
+    from mednote.tools.ehr_api import EHRStore
+
+    store = EHRStore(str(tmp_path / "ehr.json"))
+    store.save_note(app.MOCK_PATIENT_ID, "Headache follow-up.", ["G44.2"])
+    monkeypatch.setattr(get_history_module, "get_ehr_store", lambda: store)
+
+    result = app.load_patient_history()
+    assert result["visible"] is True
+    assert "G44.2" in result["value"]
+    assert "Headache follow-up." in result["value"]

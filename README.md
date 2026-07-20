@@ -4,18 +4,23 @@ MedNote Scribe is a clinical documentation agent for outpatient physicians. It c
 
 ## What's implemented
 
-- **LangGraph agent** — a 9-node graph routing five intents: SOAP note generation, ICD-10 lookup, save note, visit history, and refusal (e.g. "diagnose this patient"). Tool execution and memory are stubs until Week 2.
+- **LangGraph agent** — a 9-node graph routing five intents: SOAP note generation, ICD-10 lookup, save note, visit history, and refusal (e.g. "diagnose this patient"). Guardrails are a stub until Week 3.
 - **ICD-10 RAG pipeline** — 46,887 ICD-10-CM 2026 codes + clinical guideline sections indexed in embedded Qdrant. Retrieval is hybrid: SapBERT dense vectors (clinical paraphrases) + BM25 sparse vectors (exact terms), fused and reranked by a cross-encoder, with demographic hard filters (sex/age-impossible codes are excluded, not down-ranked) and hierarchical specificity expansion.
 - **Entity extraction** — a fast LLM rewrites colloquial transcript language into formal clinical terms before retrieval, restricted to findings documented as present: symptoms a clinician merely asks about are ignored, and symptoms are never upgraded to inferred diagnoses.
 - **Safety-first prompts** — hedged assessments only, no invented dosages, codes cited from retrieved context or an explicit "assign manually in EHR" zero-hit message, prompt-injection defense (the transcript is data, not instructions).
-- **Gradio UI** — transcript input with routine/emergency presets, draft note, ICD-10 code chips with confidence tooltips and physician-confirmation checkboxes, and a red escalation banner that bolds red-flag symptoms on emergency encounters.
+- **Mock EHR + tools** (`docs/tools.md`) — a JSON-file-backed FastAPI service (`POST /notes`, `GET /patients/{id}/history`) with two LangChain tools, `save_note` and `get_patient_history`, wired into the agent's `tool_execution` / `memory_lookup` nodes. Both tools are also exposed over MCP (`src/mednote/mcp/server.py`).
+- **Visit memory** — a SQLite store (`src/mednote/memory/store.py`) records a summary of every saved note; the agent recalls it unprompted on a later "history" query or as continuity context injected into the next SOAP note for the same patient, across separate sessions.
+- **Gradio UI** — transcript input with routine/emergency presets, draft note, ICD-10 code chips with confidence tooltips and physician-confirmation checkboxes, a red escalation banner that bolds red-flag symptoms on emergency encounters, a "Save to Chart" action, a patient-history panel, and an expandable agent-trace panel (retrieval, tool call, memory used).
 
 ## How it works
 
 ```
 transcript ─► intent router ─► entity extraction ─► hybrid retrieval ─► rerank
                                 (fast LLM)           (Qdrant: dense+sparse)
-           ─► SOAP generation (main LLM, RAG codes injected) ─► guardrails ─► UI
+           ─► SOAP generation (main LLM, RAG + memory context injected) ─► guardrails ─► UI
+                                                                                  │
+save intent ─► tool_execution ─► mock EHR (save_note) ─► visit memory (SQLite)
+history intent ─► memory_lookup ─► visit memory (SQLite)
 ```
 
 ## Setup
@@ -67,12 +72,26 @@ Allow ~60s of warm-up (SapBERT + Qdrant load) after launch. Use the **Test: Rout
 uv run pytest
 ```
 
+### Optional: run the mock EHR as a standalone REST server
+
+The agent calls the mock EHR in-process (see `docs/tools.md`), so this isn't
+needed to run the app — it's for manually poking the REST surface (`curl`,
+Postman) or driving the tools over MCP:
+
+```bash
+uv run uvicorn mednote.tools.ehr_api:app --port 8100   # REST server
+uv run python -m mednote.mcp.server                    # MCP server (stdio)
+```
+
 ## Project layout
 
 ```
 src/mednote/agent/   LangGraph nodes, prompts, state, graph
 src/mednote/rag/     ETL, indexer, retriever, reranker, pipeline
 src/mednote/llm/     provider-agnostic LLM wrapper
+src/mednote/tools/   mock EHR (FastAPI) + save_note / get_patient_history tools
+src/mednote/mcp/     MCP server exposing both EHR tools
+src/mednote/memory/  SQLite visit-memory store
 src/mednote/ui/      Gradio app
 scripts/             download / ETL / index build / validation
 data/                corpus, processed codes, Qdrant store, transcripts
