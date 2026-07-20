@@ -428,6 +428,38 @@ def render_code_chips(codes: list[dict]) -> str:
     )
 
 
+def build_trace(final: dict) -> dict:
+    """Task 16: what the graph retrieved/called/recalled, for the trace panel.
+
+    Node-by-node timing is Week 4's job (Task 24 observability); this is the
+    Week 2 slice — which RAG codes were retrieved, which tool was called with
+    what result, and what memory was used to build the response.
+    """
+    codes = final.get("suggested_codes") or []
+    memory = final.get("memory_context") or {}
+    return {
+        "intent": final.get("intent"),
+        "extracted_entities": final.get("extracted_entities", []),
+        "rag_retrieval": [
+            {
+                "code": c.get("code"),
+                "description": c.get("description"),
+                "confidence": c.get("confidence"),
+                "source": c.get("source"),
+            }
+            for c in codes
+        ],
+        "cache_hit": final.get("cache_hit", False),
+        "memory_used": {
+            "patient_id": memory.get("patient_id"),
+            "prior_visit_count": len(memory.get("prior_visits") or []),
+            "summary": memory.get("summary"),
+        },
+        "tool_call": final.get("tool_result"),
+        "errors": final.get("errors", []),
+    }
+
+
 def generate_note(transcript: str):
     if not transcript or not transcript.strip():
         gr.Warning("Paste or type a transcript before generating a note.")
@@ -436,6 +468,8 @@ def generate_note(transcript: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
+            gr.update(value=None, visible=False),
+            None,
         )
 
     try:
@@ -453,6 +487,8 @@ def generate_note(transcript: str):
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(visible=False),
+            gr.update(value=None, visible=False),
+            None,
         )
 
     note = strip_codes_section(final["final_response"])
@@ -472,7 +508,51 @@ def generate_note(transcript: str):
         gr.update(value=banner_html, visible=bool(banner_html)),
         gr.update(value=note, visible=True),
         gr.update(value=codes_html, visible=bool(codes_html)),
+        gr.update(value=build_trace(final), visible=True),
+        final,
     )
+
+
+def save_to_chart(agent_state: dict | None):
+    """Task 11-13: save the just-generated note via the save_note tool.
+
+    Takes the note straight from the agent_state produced by generate_note
+    (a gr.State, not a re-run) — the UI is the thing holding "what was just
+    reviewed" across the two clicks, since the graph itself keeps no
+    conversation memory between calls.
+    """
+    if not agent_state or not agent_state.get("draft_note"):
+        gr.Warning("Generate a note before saving it to the chart.")
+        return gr.update(visible=False)
+
+    final = run_agent(
+        "Save this note to the patient's chart.",
+        patient_id=MOCK_PATIENT_ID,
+        note=agent_state["draft_note"],
+        suggested_codes=agent_state.get("suggested_codes"),
+    )
+    tool_result = final.get("tool_result") or {}
+    if tool_result.get("ok"):
+        gr.Info(tool_result["detail"])
+    else:
+        gr.Warning(tool_result.get("detail", "Save failed."))
+    return gr.update(value=tool_result, visible=True)
+
+
+def load_patient_history():
+    """Task 12 demo: pull the mock patient's prior visits via get_patient_history."""
+    from mednote.tools.get_history import get_patient_history
+
+    result = get_patient_history.invoke({"patient_id": MOCK_PATIENT_ID})
+    if result["status"] != "found":
+        return gr.update(value="No prior visits found for this patient.", visible=True)
+
+    lines = [
+        f"**{visit['timestamp'][:10]}** (note `{visit['note_id']}`, "
+        f"codes: {', '.join(visit['icd_codes']) or 'none'}):\n\n{visit['note'][:300]}"
+        for visit in result["visits"]
+    ]
+    return gr.update(value="\n\n---\n\n".join(lines), visible=True)
 
 
 def _warm_up():
@@ -535,6 +615,10 @@ with gr.Blocks(title="MedNote Scribe") as demo:
                 dictation_btn = gr.Button("🎙  Start Dictation", elem_id="dictation-btn")
                 generate_btn = gr.Button("Generate Note", elem_id="generate-btn")
 
+            with gr.Accordion("🗂  Patient History (EHR)", open=False):
+                history_btn = gr.Button("Load Prior Visits", size="sm")
+                history_output = gr.Markdown(visible=False)
+
         with gr.Column(scale=6, elem_classes="panel-card"):
             empty_state = gr.HTML(
                 f"""
@@ -551,14 +635,32 @@ with gr.Blocks(title="MedNote Scribe") as demo:
             note_output = gr.Markdown(visible=False, elem_id="note-output")
             codes_output = gr.HTML(visible=False, elem_id="codes-output")
 
+            with gr.Row(elem_id="save-row"):
+                save_btn = gr.Button("💾  Save to Chart")
+            save_status = gr.JSON(visible=False, label="Save Result")
+
+            with gr.Accordion("🔍 Agent Trace", open=False):
+                trace_output = gr.JSON(visible=False, label="Execution Trace")
+
+    agent_state = gr.State()
+
     routine_btn.click(load_routine, outputs=transcript_input)
     emergency_btn.click(load_emergency, outputs=transcript_input)
     dictation_btn.click(start_dictation)
+    history_btn.click(load_patient_history, outputs=history_output)
     generate_btn.click(
         generate_note,
         inputs=transcript_input,
-        outputs=[empty_state, emergency_output, note_output, codes_output],
+        outputs=[
+            empty_state,
+            emergency_output,
+            note_output,
+            codes_output,
+            trace_output,
+            agent_state,
+        ],
     )
+    save_btn.click(save_to_chart, inputs=agent_state, outputs=save_status)
 
 
 def main():

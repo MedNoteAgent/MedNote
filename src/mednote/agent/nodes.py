@@ -9,8 +9,12 @@ Heavy services (SapBERT, Qdrant, the LLMs) are built lazily by the cached
 
 Stubs, replaced by later tasks:
     guardrail_check   Task 18 (deterministic red-flag + dosage rules)
-    tool_execution    Tasks 11-13 (mock EHR + MCP)
-    memory_lookup     Tasks 14-15 (visit memory)
+
+tool_execution (Tasks 11-13) and memory_lookup (Tasks 14-15) are real: the
+former calls the in-process save_note tool over the mock EHR; the latter
+reads the SQLite visit-memory store. context_extraction also now looks up
+memory context on the soap path, so note_generation can inject prior-visit
+continuity into the prompt.
 """
 
 from __future__ import annotations
@@ -96,6 +100,32 @@ def get_note_llm():
     return get_llm()
 
 
+@lru_cache(maxsize=1)
+def get_memory_store():
+    """Visit-memory store (Task 14); built once, tests monkeypatch this factory."""
+    from mednote.memory.store import MemoryStore
+
+    return MemoryStore()
+
+
+def _build_memory_context(patient_id: str | None) -> dict:
+    """Shared by context_extraction (soap path) and memory_lookup (history path)."""
+    if not patient_id:
+        return {"patient_id": "", "prior_visits": [], "summary": "No patient selected."}
+
+    history = get_memory_store().get_history(patient_id)
+    if not history:
+        return {
+            "patient_id": patient_id,
+            "prior_visits": [],
+            "summary": "No prior visits found.",
+        }
+    summary = "Prior visits:\n" + "\n".join(
+        f"- {v['visit_date']}: {v['summary']}" for v in history
+    )
+    return {"patient_id": patient_id, "prior_visits": history, "summary": summary}
+
+
 def _llm_text(message) -> str:
     """Flatten str-or-content-blocks message content (Gemini returns blocks)."""
     content = message.content
@@ -136,16 +166,20 @@ def parse_input(state: MedNoteState) -> dict:
 
 
 def context_extraction(state: MedNoteState) -> dict:
-    """Patient demographics for RAG hard-filtering.
+    """Patient demographics for RAG hard-filtering + prior-visit memory (Task 15).
 
-    The mock EHR arrives in Task 11; until then, demographics provided by the
-    caller (UI / eval harness, from the dataset labels) pass through, and
-    anything unknown stays unknown — the retriever never excludes on missing
-    information.
+    Demographics are still supplied by the caller (UI / eval harness, from
+    the dataset labels) rather than a real EHR demographics lookup — that
+    stays out of scope per docs/retrieval_process_notes.md §8.2; anything
+    unknown stays unknown so the retriever never excludes on missing
+    information. Memory context IS real (Task 14 store): this is the node
+    that runs before note_generation on the soap path, so it is where prior
+    visits get attached for continuity.
     """
-    if state.get("patient_sex"):
-        return {}
-    return {"patient_sex": "unknown"}
+    updates: dict = {"memory_context": _build_memory_context(state.get("patient_id"))}
+    if not state.get("patient_sex"):
+        updates["patient_sex"] = "unknown"
+    return updates
 
 
 def entity_extraction(state: MedNoteState) -> dict:
@@ -197,6 +231,7 @@ def note_generation(state: MedNoteState) -> dict:
         # Below the input floor: degrade gracefully, never invent a note.
         return {"draft_note": INSUFFICIENT_INPUT_MESSAGE}
 
+    memory = state.get("memory_context") or {}
     response = get_note_llm().invoke(
         [
             ("system", SOAP_SYSTEM_PROMPT),
@@ -204,6 +239,7 @@ def note_generation(state: MedNoteState) -> dict:
                 "human",
                 SOAP_USER_PROMPT.format(
                     rag_context=format_rag_context(state.get("suggested_codes") or []),
+                    memory_context=memory.get("summary", "No prior visits found."),
                     transcript=state["transcript"],
                 ),
             ),
@@ -229,30 +265,55 @@ def guardrail_check(_state: MedNoteState) -> dict:
     }
 
 
-def tool_execution(_state: MedNoteState) -> dict:
-    """STUB until Tasks 11-13 (mock EHR + save_note over MCP)."""
-    detail = (
-        "The EHR save tool is not available yet (arrives with Tasks 11-13). "
-        "The note was NOT saved."
+def tool_execution(state: MedNoteState) -> dict:
+    """Save the current draft note to the mock EHR (Tasks 11-13).
+
+    The graph is stateless per run_agent() call, so a bare "save" intent has
+    nothing to save unless the caller seeds draft_note/suggested_codes along
+    with patient_id (run_agent's note/icd_codes args) — this is the "review,
+    then click Save" flow: the UI holds the just-generated note and passes it
+    back in explicitly, rather than the agent re-deriving what to save from
+    a chat history it doesn't keep.
+    """
+    from mednote.tools.save_note import save_note
+
+    patient_id = state.get("patient_id")
+    note = state.get("draft_note")
+    if not patient_id or not note:
+        detail = "Nothing to save yet — generate a note for a patient before saving."
+        return {
+            "tool_result": {"ok": False, "detail": detail, "note_id": None},
+            "errors": [detail],
+        }
+
+    codes = [c["code"] for c in (state.get("suggested_codes") or []) if c.get("code")]
+    result = save_note.invoke({"patient_id": patient_id, "note": note, "icd_codes": codes})
+
+    if result.get("status") != "saved":
+        detail = result.get("message", "Failed to save note.")
+        return {
+            "tool_result": {"ok": False, "detail": detail, "note_id": None},
+            "errors": [detail],
+        }
+
+    # Mirror the save into visit memory (Task 14/15) so a later "history" /
+    # soap-path lookup can recall it, even though the EHR JSON store and the
+    # memory SQLite store are separate (docs/tools.md).
+    get_memory_store().save_visit(
+        patient_id=patient_id,
+        visit_date=result["timestamp"][:10],
+        note_id=result["note_id"],
+        summary=note[:280],
+        icd_codes=codes,
     )
-    return {
-        "tool_result": {"ok": False, "detail": detail, "note_id": None},
-        "errors": [detail],
-    }
+
+    detail = f"Note saved to patient {patient_id}'s chart (note ID {result['note_id']})."
+    return {"tool_result": {"ok": True, "detail": detail, "note_id": result["note_id"]}}
 
 
 def memory_lookup(state: MedNoteState) -> dict:
-    """STUB until Tasks 14-15 (visit memory)."""
-    return {
-        "memory_context": {
-            "patient_id": state.get("patient_id", ""),
-            "prior_visits": [],
-            "summary": (
-                "No prior visit records are available yet — visit memory "
-                "arrives with Tasks 14-15."
-            ),
-        }
-    }
+    """Prior-visit recall for the "history" intent (Task 15)."""
+    return {"memory_context": _build_memory_context(state.get("patient_id"))}
 
 
 def response_generation(state: MedNoteState) -> dict:

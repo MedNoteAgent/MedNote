@@ -72,8 +72,10 @@ def test_soap_prompt_forbids_code_fabrication_and_injection() -> None:
 
 
 def test_soap_user_prompt_has_exactly_the_expected_slots() -> None:
-    rendered = SOAP_USER_PROMPT.format(rag_context="RAGCTX", transcript="TRANSCRIPT")
-    assert "RAGCTX" in rendered and "TRANSCRIPT" in rendered
+    rendered = SOAP_USER_PROMPT.format(
+        rag_context="RAGCTX", memory_context="MEMCTX", transcript="TRANSCRIPT"
+    )
+    assert "RAGCTX" in rendered and "MEMCTX" in rendered and "TRANSCRIPT" in rendered
     with pytest.raises(KeyError):
         SOAP_USER_PROMPT.format(transcript="only-one-slot")
 
