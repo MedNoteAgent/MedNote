@@ -1704,6 +1704,8 @@ class MemoryStore:
             return [dict(row) for row in rows]
 ```
 
+> **As built (2026-07-19)** — `memory/store.py` follows this sketch with three refinements: `get_history` parses `icd_codes` back to a `list` (callers never see the JSON string), ordering is `visit_date DESC, id DESC` (stable for same-day visits), and a module-level `get_db_path()` seam mirrors the EHR store's test pattern (tests monkeypatch it to a temp SQLite file). Covered by `tests/test_memory_store.py`. Task 14 complete.
+
 ---
 
 ### Task 15: Memory Integration into Graph
@@ -1733,6 +1735,12 @@ Also update `note_generation` to inject `memory_context` into the LLM prompt whe
 
 **Test:** Save a note in session 1; query "what was noted last visit" in session 2 → should surface the prior note.
 
+> **As built (2026-07-19)** — three integration points landed:
+> - `memory_lookup` replaced: real `MemoryStore` lookup, newest-first summary lines (`date: summary (note N_x; codes)`), with graceful paths for "no patient ID" and "no prior visits".
+> - **Memory writes** happen in `tool_execution`: a successful `save_note` mirrors the visit into the store (`_record_visit_memory`, best-effort — a memory failure logs a warning but never undoes the EHR save; summary derived from the note's Assessment line via `_summarize_note`).
+> - `note_generation` injects memory through the prompt layer as planned: `SOAP_USER_PROMPT` gained a `{memory_context}` slot filled by `format_memory_context()`, which renders `""` when there are no prior visits and otherwise frames the history as *continuity background only — do not copy findings the transcript doesn't support* (anti-fabrication guard travels with the block). `memory_context` reaches SOAP state only when a caller supplies it today; the UI/eval harness can pass it, and Task 16's UI wiring is the natural place to populate it.
+> - DoD covered by `test_history_path_recalls_saved_visit` (save → recall across graph invocations) and `test_persists_across_instances` (cross-process SQLite persistence). Suite: 144 tests green. Tasks 14–15 complete.
+
 ---
 
 ### Task 16: Agent Trace Panel in Gradio UI
@@ -1753,6 +1761,13 @@ with gr.Accordion("🔍 Agent Trace", open=False):
 2. **Save + history surfaces for the Week 2 demo** (the workspace has no chat box to type "save this note", so the `save`/`history` intents need UI affordances): a "💾 Save to EHR" button on the generated note (calls the agent with the save intent → shows the returned `note_id`) and a "Prior Visits" panel or accordion fed by `memory_lookup`.
 
 **Trace data source:** the full `RequestTrace` tracer only arrives in Task 24 (Week 4). For this task, render the trace from the **final agent state** returned by `run_agent(...)` — it already carries `extracted_entities`, `suggested_codes` (with confidence + source), `cache_hit`, `guardrail_result`, `tool_result`, `memory_context`, and `errors`. Per-node timing and raw top-15 retrieval chunks are deferred to Task 24; don't build a second tracer here.
+
+> **As built (2026-07-20)** — implemented exactly per the premise update above (additive to the workspace layout, no rewrite):
+> - **Save to EHR**: green button + status banner in the note column, hidden until a note exists. `generate_note` stages `{patient_id, draft_note (raw, pre-rendering), suggested_codes}` in a `gr.State`; clicking Save routes the save intent through `run_agent(...)` — which gained optional `draft_note`/`suggested_codes`/`memory_context` state-seeding params — so `tool_execution`'s LLM makes the real tool call (💰 1 call per save; EHR down → amber "NOT saved" banner). Clicking is the guardrail-G5 confirmation; an empty stage warns and runs nothing.
+> - **Prior Visits accordion** (left column) reads SQLite visit memory via the same `memory_lookup` node the history intent uses (free); refreshes on demand and automatically after every save.
+> - **Agent Trace accordion** (note column): `build_trace()` compacts the final state (trace_id, intent, latency_ms measured around the run, entities, code+confidence pairs, cache_hit, guardrail, tool_result, memory summary, errors) into a `gr.JSON`; updated by both Generate and Save. No second tracer built.
+> - **Memory into SOAP**: `generate_note` now passes `fetch_memory_context(patient_id)` into the agent, closing the Task 15 loose end — prior visits reach `SOAP_USER_PROMPT` on every generation.
+> - Verified: 150 tests green (12 UI-handler tests updated/added); live launch check confirms the page serves with all four new components (`save-btn`, `save-status`, `trace-accordion`, `history-accordion`). Run the mock EHR (`uv run uvicorn mednote.tools.ehr_api:app --port 8100`) alongside the UI for saves to succeed. **Task 16 — and with it Week 2 (Tasks 10–16) — complete.**
 
 ---
 
