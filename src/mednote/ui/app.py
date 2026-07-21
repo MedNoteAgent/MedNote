@@ -1,18 +1,25 @@
-"""Gradio UI for MedNote Scribe (tasks.md Task 9).
+"""Gradio UI for MedNote Scribe (tasks.md Tasks 9 + 16).
 
-"Generate Note" runs the full Task 8 LangGraph agent (intent routing -> RAG
-over the ICD-10 index -> SOAP generation -> guardrail stub) via run_agent().
-"Start Dictation" remains a stub since live audio transcription is out of
-scope for the demo (requirements.md §4).
+"Generate Note" runs the full LangGraph agent (intent routing -> RAG over the
+ICD-10 index -> SOAP generation -> guardrail stub) via run_agent(). Task 16
+adds: a "Save to EHR" button (explicit physician save -> tool_execution's LLM
+tool call), a Prior Visits accordion fed by SQLite visit memory, and an Agent
+Trace accordion rendered from the final agent state (the per-node tracer
+arrives with Task 24). "Start Dictation" remains a stub since live audio
+transcription is out of scope for the demo (requirements.md §4).
 
 Launch (from the repo root, after `scripts/build_index.py` has been run):
-    uv run python -m mednote.ui.app
+    uv run uvicorn mednote.tools.ehr_api:app --port 8100   # terminal 1 (for Save)
+    uv run python -m mednote.ui.app                        # terminal 2
+Without the EHR server, note generation still works; Save degrades to a
+clear "NOT saved" banner.
 """
 
 import html
 import logging
 import re
 import threading
+import time
 
 import gradio as gr
 
@@ -21,7 +28,7 @@ from mednote.agent.graph import run_agent
 logger = logging.getLogger(__name__)
 
 # Demo patient shown in the header chip; demographics feed the RAG demographic
-# filter until the mock EHR lands (Task 11).
+# filter (seeded in the mock EHR as P-DEMO with matching age/sex).
 MOCK_PATIENT_ID = "P-DEMO"
 MOCK_PATIENT_NAME = "Sarah Jenkins"
 MOCK_PATIENT_DOB = "05/12/1982"
@@ -291,6 +298,77 @@ CSS = """
     line-height: 1.6;
     margin: 12px 0 0 0;
 }
+#save-row {
+    padding: 0 20px 16px 20px !important;
+}
+#save-btn {
+    background: #1e7e46 !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 600 !important;
+    border-radius: 10px !important;
+}
+#save-status {
+    padding: 0 20px 16px 20px !important;
+}
+.save-status-banner {
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+.save-status-banner.success {
+    background: #e8f5ec;
+    border: 1px solid #b7e0c3;
+    color: #1e7e46;
+}
+.save-status-banner.failure {
+    background: #fdf6e3;
+    border: 1px solid #f0d9a0;
+    color: #8a6d1a;
+}
+#trace-accordion, #history-accordion {
+    margin: 0 20px 20px 20px !important;
+    border: 1px solid #e5e9ef !important;
+    border-radius: 10px !important;
+    background: #fafbfc !important;
+}
+/* Gradio emits light text when the OS is in dark mode — the container forces
+   a light background, so every text inside the new panels must be pinned
+   dark explicitly (same reason #note-output pins its colors above). */
+#trace-accordion .label-wrap, #history-accordion .label-wrap,
+#trace-accordion .label-wrap span, #history-accordion .label-wrap span {
+    color: #1a2233 !important;
+    font-weight: 600;
+}
+#history-accordion .prose, #history-accordion .prose * {
+    font-size: 0.85rem;
+    color: #2a3346 !important;
+}
+#history-refresh-btn {
+    background: white !important;
+    border: 1px solid #d7dce4 !important;
+    color: #3a4356 !important;
+    border-radius: 999px !important;
+    font-size: 0.8rem !important;
+    box-shadow: none !important;
+}
+/* gr.JSON (and gr.Markdown) wrap themselves in .block containers whose
+   background comes from the theme (dark in OS dark mode) — flatten every
+   wrapper inside the accordions so content sits on the light panel. */
+#trace-accordion .block, #trace-accordion .json-holder, #trace-accordion .container,
+#history-accordion .block {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+#trace-accordion .json-holder, #trace-accordion .json-holder * {
+    color: #2a3346 !important;
+    background: transparent !important;
+}
+.codes-footer, .codes-footer em, .codes-footer strong {
+    color: #6b7488 !important;
+}
 """
 
 PULSE_ICON = """<svg width="22" height="22" viewBox="0 0 24 24" fill="none"
@@ -428,50 +506,153 @@ def render_code_chips(codes: list[dict]) -> str:
     )
 
 
+def build_trace(final: dict, elapsed_ms: float) -> dict:
+    """Compact execution trace rendered from the final agent state (Task 16).
+
+    Per-node timing and the raw pre-rerank candidates arrive with the real
+    tracer (Task 24) — this deliberately reads only what the graph already
+    returns, so there is no second tracing mechanism to keep in sync.
+    """
+    return {
+        "trace_id": final.get("trace_id"),
+        "intent": final.get("intent"),
+        "latency_ms": round(elapsed_ms),
+        "extracted_entities": final.get("extracted_entities") or [],
+        "suggested_codes": [
+            {"code": c.get("code"), "confidence": round(c.get("confidence", 0.0), 3)}
+            for c in (final.get("suggested_codes") or [])
+        ],
+        "cache_hit": final.get("cache_hit", False),
+        "guardrail": final.get("guardrail_result"),
+        "tool_result": final.get("tool_result"),
+        "memory": (final.get("memory_context") or {}).get("summary"),
+        "errors": final.get("errors") or [],
+    }
+
+
+def fetch_memory_context(patient_id: str) -> dict | None:
+    """Prior-visit context for SOAP continuity (Task 15). None when empty,
+    so first visits add nothing to the prompt."""
+    from mednote.agent.nodes import memory_lookup
+
+    context = memory_lookup({"patient_id": patient_id})["memory_context"]
+    return context if context["prior_visits"] else None
+
+
+def render_prior_visits(patient_id: str = MOCK_PATIENT_ID) -> str:
+    """Markdown for the Prior Visits accordion — the same SQLite memory the
+    history intent reads (free: no LLM, no EHR server needed)."""
+    from mednote.agent.nodes import memory_lookup
+
+    return memory_lookup({"patient_id": patient_id})["memory_context"]["summary"]
+
+
+def render_save_status(tool_result: dict) -> str:
+    if tool_result.get("ok"):
+        note_id = html.escape(str(tool_result.get("note_id")))
+        return (
+            '<div class="save-status-banner success">✅ Saved to EHR — note ID '
+            f"{note_id}. Also recorded in visit memory.</div>"
+        )
+    detail = html.escape(tool_result.get("detail", "Save failed."))
+    return f'<div class="save-status-banner failure">⚠️ {detail}</div>'
+
+
+def _generation_failed():
+    """The 8-output tuple for paths where no note was produced."""
+    hidden = gr.update(visible=False)
+    return (
+        gr.update(visible=True),   # empty state back
+        hidden,                    # emergency banner
+        hidden,                    # note
+        hidden,                    # code chips
+        hidden,                    # save button
+        hidden,                    # save status
+        gr.update(),               # trace unchanged
+        None,                      # last_result state cleared
+    )
+
+
 def generate_note(transcript: str):
     if not transcript or not transcript.strip():
         gr.Warning("Paste or type a transcript before generating a note.")
-        return (
-            gr.update(visible=True),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-        )
+        return _generation_failed()
 
+    t0 = time.perf_counter()
     try:
         final = run_agent(
             transcript,
             patient_id=MOCK_PATIENT_ID,
             patient_age=MOCK_PATIENT_AGE,
             patient_sex=MOCK_PATIENT_SEX,
+            # Task 15: prior-visit continuity flows into SOAP generation.
+            memory_context=fetch_memory_context(MOCK_PATIENT_ID),
         )
     except Exception as exc:  # surface the failure in the UI, never a stack trace
         logger.exception("Agent run failed")
         gr.Warning(f"Note generation failed: {exc}")
-        return (
-            gr.update(visible=True),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-        )
+        return _generation_failed()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
 
     note = strip_codes_section(final["final_response"])
     # Emergency encounters carry an escalation warning above the SOAP note —
     # lift it into a red alert banner instead of rendering it as plain prose.
     escalation, note = split_escalation(note)
     banner_html = render_emergency_banner(escalation) if escalation else ""
-    # Soft failures (zero-hit, stub tools) ride the errors channel — surface
+    # Soft failures (zero-hit, EHR down) ride the errors channel — surface
     # them under the note instead of hiding them (skip any already in the note).
     extra = [e for e in final.get("errors", []) if e not in note]
     if extra:
         note += "\n\n---\n" + "\n".join(f"> ⚠️ {e}" for e in extra)
 
-    codes_html = render_code_chips(final.get("suggested_codes") or [])
+    codes = final.get("suggested_codes") or []
+    codes_html = render_code_chips(codes)
+    # What the Save button will hand to tool_execution (guardrail G5: the
+    # save happens only when the physician clicks — this is just staging).
+    last_result = {
+        "patient_id": MOCK_PATIENT_ID,
+        "note": final.get("draft_note") or final["final_response"],
+        "codes": codes,
+    }
     return (
         gr.update(visible=False),
         gr.update(value=banner_html, visible=bool(banner_html)),
         gr.update(value=note, visible=True),
         gr.update(value=codes_html, visible=bool(codes_html)),
+        gr.update(visible=True),                       # reveal Save to EHR
+        gr.update(value="", visible=False),            # reset old save status
+        gr.update(value=build_trace(final, elapsed_ms)),
+        last_result,
+    )
+
+
+def save_note_to_ehr(last_result: dict | None):
+    """Explicit physician save (guardrail G5) — routes the save intent through
+    the agent, so tool_execution's LLM makes the actual tool call. 💰 1 LLM
+    call; needs the mock EHR running (degrades to a failure banner if not)."""
+    if not last_result or not last_result.get("note"):
+        gr.Warning("Generate a note first — there is nothing to save.")
+        return gr.update(visible=False), gr.update(), gr.update()
+
+    t0 = time.perf_counter()
+    try:
+        final = run_agent(
+            "Save this note to the patient's chart.",
+            patient_id=last_result["patient_id"],
+            draft_note=last_result["note"],
+            suggested_codes=last_result["codes"],
+        )
+    except Exception as exc:
+        logger.exception("Save to EHR failed")
+        status = render_save_status({"ok": False, "detail": f"Save failed: {exc}"})
+        return gr.update(value=status, visible=True), gr.update(), gr.update()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    tool_result = final.get("tool_result") or {"ok": False, "detail": "No tool result returned."}
+    return (
+        gr.update(value=render_save_status(tool_result), visible=True),
+        gr.update(value=build_trace(final, elapsed_ms)),
+        gr.update(value=render_prior_visits(last_result["patient_id"])),
     )
 
 
@@ -535,6 +716,16 @@ with gr.Blocks(title="MedNote Scribe") as demo:
                 dictation_btn = gr.Button("🎙  Start Dictation", elem_id="dictation-btn")
                 generate_btn = gr.Button("Generate Note", elem_id="generate-btn")
 
+            with gr.Accordion(
+                "🗂 Prior Visits (agent memory)", open=False, elem_id="history-accordion"
+            ):
+                history_output = gr.Markdown(
+                    "Click *Refresh* to load this patient's prior visits from memory."
+                )
+                refresh_history_btn = gr.Button(
+                    "Refresh", size="sm", elem_id="history-refresh-btn"
+                )
+
         with gr.Column(scale=6, elem_classes="panel-card"):
             empty_state = gr.HTML(
                 f"""
@@ -551,14 +742,32 @@ with gr.Blocks(title="MedNote Scribe") as demo:
             note_output = gr.Markdown(visible=False, elem_id="note-output")
             codes_output = gr.HTML(visible=False, elem_id="codes-output")
 
+            with gr.Row(elem_id="save-row", visible=False) as save_row:
+                save_btn = gr.Button("💾 Save to EHR", elem_id="save-btn")
+            save_status = gr.HTML(visible=False, elem_id="save-status")
+
+            with gr.Accordion("🔍 Agent Trace", open=False, elem_id="trace-accordion"):
+                trace_output = gr.JSON(value=None)
+
+    last_result = gr.State(None)
+
     routine_btn.click(load_routine, outputs=transcript_input)
     emergency_btn.click(load_emergency, outputs=transcript_input)
     dictation_btn.click(start_dictation)
     generate_btn.click(
         generate_note,
         inputs=transcript_input,
-        outputs=[empty_state, emergency_output, note_output, codes_output],
+        outputs=[
+            empty_state, emergency_output, note_output, codes_output,
+            save_row, save_status, trace_output, last_result,
+        ],
     )
+    save_btn.click(
+        save_note_to_ehr,
+        inputs=last_result,
+        outputs=[save_status, trace_output, history_output],
+    )
+    refresh_history_btn.click(render_prior_visits, outputs=history_output)
 
 
 def main():
