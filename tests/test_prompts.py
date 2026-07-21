@@ -16,6 +16,7 @@ from mednote.agent.prompts import (
     REFUSAL_PROMPT,
     SOAP_SYSTEM_PROMPT,
     SOAP_USER_PROMPT,
+    format_memory_context,
     format_rag_context,
 )
 
@@ -72,10 +73,31 @@ def test_soap_prompt_forbids_code_fabrication_and_injection() -> None:
 
 
 def test_soap_user_prompt_has_exactly_the_expected_slots() -> None:
-    rendered = SOAP_USER_PROMPT.format(rag_context="RAGCTX", transcript="TRANSCRIPT")
+    rendered = SOAP_USER_PROMPT.format(
+        memory_context="", rag_context="RAGCTX", transcript="TRANSCRIPT"
+    )
     assert "RAGCTX" in rendered and "TRANSCRIPT" in rendered
     with pytest.raises(KeyError):
         SOAP_USER_PROMPT.format(transcript="only-one-slot")
+
+
+def test_format_memory_context_empty_renders_nothing() -> None:
+    assert format_memory_context(None) == ""
+    assert format_memory_context(
+        {"patient_id": "P001", "prior_visits": [], "summary": "No prior visits."}
+    ) == ""
+
+
+def test_format_memory_context_frames_history_as_background_only() -> None:
+    text = format_memory_context({
+        "patient_id": "P001",
+        "prior_visits": [{"note_id": "N_1"}],
+        "summary": "- 2026-07-18: Possible tension-type headache.",
+    })
+    assert "Possible tension-type headache" in text
+    lower = text.lower()
+    assert "continuity" in lower
+    assert "do not copy" in lower  # anti-fabrication guard travels with the block
 
 
 # ----------------------------------------------------------- other prompts ---

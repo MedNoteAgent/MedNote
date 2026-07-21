@@ -93,11 +93,18 @@ def run_agent(
     patient_age: int | None = None,
     patient_sex: str | None = None,
     trace_id: str | None = None,
+    draft_note: str | None = None,
+    suggested_codes: list | None = None,
+    memory_context: dict | None = None,
 ) -> MedNoteState:
     """One full turn: seed state, invoke the graph, return the final state.
 
-    Demographics are optional; until the mock EHR lands (Task 11) the caller
-    (UI / eval harness) supplies them from its own records.
+    Demographics are optional — caller-supplied values win; otherwise
+    ``context_extraction`` asks the mock EHR (Task 11). ``draft_note`` and
+    ``suggested_codes`` let the UI's Save button (Task 16) hand the generated
+    note to ``tool_execution`` without the 40-word ``parse_input`` transcript
+    heuristic ever seeing it. ``memory_context`` injects prior-visit
+    continuity into SOAP generation (Task 15).
     """
     state = make_initial_state(user_input, trace_id or str(uuid.uuid4()))
     if patient_id is not None:
@@ -106,4 +113,10 @@ def run_agent(
         state["patient_age"] = patient_age
     if patient_sex is not None:
         state["patient_sex"] = patient_sex
+    if draft_note is not None:
+        state["draft_note"] = draft_note
+    if suggested_codes is not None:
+        state["suggested_codes"] = suggested_codes
+    if memory_context is not None:
+        state["memory_context"] = memory_context
     return get_compiled_graph().invoke(state)

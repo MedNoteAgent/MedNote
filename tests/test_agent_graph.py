@@ -181,19 +181,41 @@ def ehr(tmp_path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ehr_client, "get_client", lambda: TestClient(ehr_api.app))
 
 
-def test_save_path_executes_tool_and_returns_note_id(fakes, ehr, monkeypatch) -> None:
+@pytest.fixture()
+def memory(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Visit-memory store on a temp SQLite file."""
+    from mednote.memory import store
+
+    monkeypatch.setattr(store, "get_db_path", lambda: str(tmp_path / "memory.db"))
+
+
+def test_save_path_executes_tool_and_returns_note_id(fakes, ehr, memory, monkeypatch) -> None:
     tool_llm = FakeToolLLM(
-        [{"name": "save_note", "args": {"patient_id": "P001", "note": "SOAP body"},
+        [{"name": "save_note",
+          "args": {"patient_id": "P001", "note": "SOAP body", "icd_codes": ["G44.2"]},
           "id": "call_1", "type": "tool_call"}]
     )
     monkeypatch.setattr(nodes, "get_tool_llm", lambda: tool_llm)
 
-    final = run_agent(BY_ID["TX003"]["transcript"], patient_id="P001")
+    final = run_agent(
+        BY_ID["TX003"]["transcript"],
+        patient_id="P001",
+        draft_note="STAGED-DRAFT-FROM-UI",   # Task 16: Save button passes it via state
+    )
     assert final["tool_result"]["ok"] is True
     assert final["tool_result"]["note_id"].startswith("N_")
     assert final["tool_result"]["note_id"] in final["final_response"]
-    # The request context handed to the LLM carried the patient ID.
+    # The request context handed to the LLM carried the patient ID and draft.
     assert "P001" in str(tool_llm.messages)
+    assert "STAGED-DRAFT-FROM-UI" in str(tool_llm.messages)
+
+    # Task 15: the successful save was mirrored into visit memory.
+    from mednote.memory.store import MemoryStore
+
+    visits = MemoryStore().get_history("P001")
+    assert len(visits) == 1
+    assert visits[0]["note_id"] == final["tool_result"]["note_id"]
+    assert visits[0]["icd_codes"] == ["G44.2"]
 
 
 def test_save_path_degrades_when_ehr_down(fakes, monkeypatch) -> None:
@@ -253,9 +275,60 @@ def test_context_extraction_degrades_when_ehr_down(monkeypatch) -> None:
     assert result == {"patient_sex": "unknown"}
 
 
-def test_history_path_reports_stub_memory(fakes) -> None:
+def test_history_path_empty_memory_says_no_prior_visits(fakes, memory) -> None:
     final = run_agent(BY_ID["TX004"]["transcript"], patient_id="P001")
-    assert "No prior visit records" in final["final_response"]
+    assert "No prior visits found for patient P001" in final["final_response"]
+
+
+def test_history_path_recalls_saved_visit(fakes, memory) -> None:
+    """Task 15 DoD: a visit saved earlier surfaces on the history intent."""
+    from mednote.memory.store import MemoryStore
+
+    MemoryStore().save_visit(
+        "P001", "2026-07-18", "N_prior1",
+        "Possible tension-type headache — physician review.", ["G44.2"],
+    )
+
+    final = run_agent(BY_ID["TX004"]["transcript"], patient_id="P001")
+    assert "Prior visits for patient P001" in final["final_response"]
+    assert "tension-type headache" in final["final_response"]
+    assert "N_prior1" in final["final_response"]
+    assert "G44.2" in final["final_response"]
+    assert final["memory_context"]["prior_visits"][0]["note_id"] == "N_prior1"
+
+
+def test_history_path_without_patient_id_degrades(fakes, memory) -> None:
+    final = run_agent(BY_ID["TX004"]["transcript"])
+    assert "No patient ID provided" in final["final_response"]
+
+
+def test_note_generation_injects_memory_context(fakes, monkeypatch) -> None:
+    """Task 15: prior-visit context reaches the SOAP prompt — framed as
+    background only — and is absent when there is no memory."""
+
+    class RecordingLLM:
+        def __init__(self):
+            self.messages = None
+
+        def invoke(self, messages):
+            self.messages = messages
+            return SimpleNamespace(content=CANNED_NOTE)
+
+    llm = RecordingLLM()
+    monkeypatch.setattr(nodes, "get_note_llm", lambda: llm)
+
+    base_state = {"transcript": "Patient reports headache.", "errors": []}
+    nodes.note_generation({**base_state, "memory_context": {
+        "patient_id": "P001",
+        "prior_visits": [{"note_id": "N_prior1"}],
+        "summary": "- 2026-07-18: Possible tension-type headache.",
+    }})
+    prompt = str(llm.messages)
+    assert "Possible tension-type headache" in prompt
+    assert "continuity" in prompt  # background-only framing, not new findings
+
+    nodes.note_generation(base_state)  # no memory -> no block
+    assert "continuity" not in str(llm.messages)
 
 
 def test_zero_hit_accumulates_error_and_still_drafts(monkeypatch) -> None:

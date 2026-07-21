@@ -9,7 +9,6 @@ Heavy services (SapBERT, Qdrant, the LLMs) are built lazily by the cached
 
 Stubs, replaced by later tasks:
     guardrail_check   Task 18 (deterministic red-flag + dosage rules)
-    memory_lookup     Tasks 14-15 (visit memory)
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ from mednote.agent.prompts import (
     SOAP_SYSTEM_PROMPT,
     SOAP_USER_PROMPT,
     TOOL_SYSTEM_PROMPT,
+    format_memory_context,
     format_rag_context,
 )
 from mednote.agent.state import MedNoteState
@@ -246,6 +246,7 @@ def note_generation(state: MedNoteState) -> dict:
             (
                 "human",
                 SOAP_USER_PROMPT.format(
+                    memory_context=format_memory_context(state.get("memory_context")),
                     rag_context=format_rag_context(state.get("suggested_codes") or []),
                     transcript=state["transcript"],
                 ),
@@ -331,7 +332,45 @@ def tool_execution(state: MedNoteState) -> dict:
             "errors": [detail],
         }
 
-    return _format_tool_result(call["name"], result)
+    updates = _format_tool_result(call["name"], result)
+    if call["name"] == "save_note" and updates["tool_result"]["ok"]:
+        # Task 15: mirror the saved note into visit memory so the history
+        # intent can recall it in a later session. Best-effort — a memory
+        # failure must never undo a successful EHR save.
+        _record_visit_memory(call["args"], updates["tool_result"]["note_id"])
+    return updates
+
+
+def _record_visit_memory(args: dict, note_id: str | None) -> None:
+    from datetime import date
+
+    from mednote.memory.store import MemoryStore
+
+    try:
+        MemoryStore().save_visit(
+            patient_id=args.get("patient_id", ""),
+            visit_date=date.today().isoformat(),
+            note_id=note_id,
+            summary=_summarize_note(args.get("note", "")),
+            icd_codes=args.get("icd_codes") or [],
+        )
+    except Exception:
+        logger.warning("Could not record visit in memory store", exc_info=True)
+
+
+def _summarize_note(note: str) -> str:
+    """One-line visit summary: first Assessment line if the note has one,
+    else the first non-header line. Capped so memory rows stay scannable."""
+    lines = [line.strip() for line in note.splitlines()]
+    start = 0
+    for i, line in enumerate(lines):
+        if line.lower().startswith("### assessment"):
+            start = i + 1
+            break
+    for line in lines[start:]:
+        if line and not line.startswith("#"):
+            return line[:160]
+    return note.strip()[:160] or "Visit note saved."
 
 
 def _format_tool_result(tool_name: str, result: dict) -> dict:
@@ -368,15 +407,35 @@ def _format_tool_result(tool_name: str, result: dict) -> dict:
 
 
 def memory_lookup(state: MedNoteState) -> dict:
-    """STUB until Tasks 14-15 (visit memory)."""
+    """Query visit memory (SQLite) for the patient's prior notes (Tasks 14-15)."""
+    from mednote.memory.store import MemoryStore
+
+    patient_id = state.get("patient_id") or ""
+    if not patient_id:
+        summary = "No patient ID provided — cannot look up visit history."
+        return {"memory_context": {"patient_id": "", "prior_visits": [], "summary": summary}}
+
+    history = MemoryStore().get_history(patient_id)
+    if not history:
+        summary = f"No prior visits found for patient {patient_id}."
+        return {
+            "memory_context": {
+                "patient_id": patient_id, "prior_visits": [], "summary": summary,
+            }
+        }
+
+    lines = [f"Prior visits for patient {patient_id}:"]
+    for visit in history:
+        codes = ", ".join(visit["icd_codes"]) if visit["icd_codes"] else "no codes"
+        lines.append(
+            f"- {visit['visit_date']}: {visit['summary']} "
+            f"(note {visit['note_id']}; {codes})"
+        )
     return {
         "memory_context": {
-            "patient_id": state.get("patient_id", ""),
-            "prior_visits": [],
-            "summary": (
-                "No prior visit records are available yet — visit memory "
-                "arrives with Tasks 14-15."
-            ),
+            "patient_id": patient_id,
+            "prior_visits": history,
+            "summary": "\n".join(lines),
         }
     }
 
